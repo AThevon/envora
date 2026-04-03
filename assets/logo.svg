@@ -1,11 +1,11 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="620" height="160" viewBox="0 0 620 160">
   <rect width="620" height="160" rx="12" fill="#13111c"/>
-  <g font-family="'SFMono-Regular','Menlo','Consolas','Liberation Mono','Courier New',monospace" font-size="14" font-weight="bold">
-    <text xml:space="preserve" x="58" y="35"><tspan fill="#10B981"> ▄▄▄▄▄▄▄</tspan><tspan fill="#22C997"> ▄▄▄    ▄▄▄</tspan><tspan fill="#4ADE80"> ▄▄▄▄  ▄▄▄▄</tspan><tspan fill="#86EFAC">   ▄▄▄▄▄</tspan><tspan fill="#BBF7D0">   ▄▄▄▄▄▄▄     ▄▄▄▄</tspan></text>
-    <text xml:space="preserve" x="58" y="55"><tspan fill="#10B981">███▀▀▀▀▀</tspan><tspan fill="#22C997"> ████▄  ███</tspan><tspan fill="#4ADE80"> ▀███  ███▀</tspan><tspan fill="#86EFAC"> ▄███████▄</tspan><tspan fill="#BBF7D0"> ███▀▀███▄ ▄██▀▀██▄</tspan></text>
-    <text xml:space="preserve" x="58" y="75"><tspan fill="#10B981">███▄▄   </tspan><tspan fill="#22C997"> ███▀██▄███</tspan><tspan fill="#4ADE80">  ███  ███</tspan><tspan fill="#86EFAC">  ███   ███</tspan><tspan fill="#BBF7D0"> ███▄▄███▀ ███  ███</tspan></text>
-    <text xml:space="preserve" x="58" y="95"><tspan fill="#10B981">███     </tspan><tspan fill="#22C997"> ███  ▀████</tspan><tspan fill="#4ADE80">  ███▄▄███</tspan><tspan fill="#86EFAC">  ███▄▄▄███</tspan><tspan fill="#BBF7D0"> ███▀▀██▄  ███▀▀███</tspan></text>
-    <text xml:space="preserve" x="58" y="115"><tspan fill="#10B981">▀███████</tspan><tspan fill="#22C997"> ███    ███</tspan><tspan fill="#4ADE80">   ▀████▀</tspan><tspan fill="#86EFAC">    ▀█████▀</tspan><tspan fill="#BBF7D0">  ███  ▀███ ███  ███</tspan></text>
+  <g font-family="'SFMono-Regular','Menlo','Consolas','Liberation Mono','Courier New',monospace" font-size="14" font-weight="bold" text-anchor="middle">
+    <text xml:space="preserve" x="310" y="35" fill="#6EE7B7"> ▄▄▄▄▄▄▄ ▄▄▄    ▄▄▄ ▄▄▄▄  ▄▄▄▄   ▄▄▄▄▄   ▄▄▄▄▄▄▄     ▄▄▄▄</text>
+    <text xml:space="preserve" x="310" y="55" fill="#6EE7B7">███▀▀▀▀▀ ████▄  ███ ▀███  ███▀ ▄███████▄ ███▀▀███▄ ▄██▀▀██▄</text>
+    <text xml:space="preserve" x="310" y="75" fill="#6EE7B7">███▄▄    ███▀██▄███  ███  ███  ███   ███ ███▄▄███▀ ███  ███</text>
+    <text xml:space="preserve" x="310" y="95" fill="#6EE7B7">███      ███  ▀████  ███▄▄███  ███▄▄▄███ ███▀▀██▄  ███▀▀███</text>
+    <text xml:space="preserve" x="310" y="115" fill="#6EE7B7">▀███████ ███    ███   ▀████▀    ▀█████▀  ███  ▀███ ███  ███</text>
   </g>
   <text x="310" y="145" text-anchor="middle" font-family="'SFMono-Regular','Menlo','Consolas',monospace" font-size="11" fill="#6B7280">encrypted .env vault</text>
 </svg>
