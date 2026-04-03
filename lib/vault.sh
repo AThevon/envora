@@ -244,36 +244,62 @@ cmd_list() {
 }
 
 cmd_clean() {
-  local projects=()
+  local entries=()
   for dir in "$ENVOY_VAULT"/*/; do
     [[ -d "$dir" ]] || continue
     local name
     name=$(basename "$dir")
     [[ "$name" == ".git" ]] && continue
-    projects+=("$name")
+    local files
+    files=$(find_age_files "$dir" | xargs -I{} basename {} .age 2>/dev/null | tr '\n' ' ')
+    local count
+    count=$(find_age_files "$dir" | wc -l)
+    entries+=("${name}|${count} file(s)|${files}")
   done
 
-  if [[ ${#projects[@]} -eq 0 ]]; then
+  if [[ ${#entries[@]} -eq 0 ]]; then
     ui_warn "Vault is empty"
     return 0
   fi
 
+  local header
+  header=$(printf '%b' "${C_1}clean${C_RESET}  ${C_DIM}select project to remove${C_RESET}")
+
   local selected
-  selected=$(printf '%s\n' "${projects[@]}" | gum filter --prompt="Remove from vault > " --height=15) || return 0
+  selected=$(printf '%s\n' "${entries[@]}" | \
+    fzf --height=40% \
+        --layout=reverse \
+        --border \
+        --ansi \
+        --header="$header" \
+        --delimiter='|' \
+        --with-nth=1 \
+        --preview='
+          name=$(echo {} | cut -d"|" -f1);
+          count=$(echo {} | cut -d"|" -f2);
+          files=$(echo {} | cut -d"|" -f3);
+          printf "\033[1m%s\033[0m\n%s\n\n" "$name" "$count";
+          printf "\033[38;2;52;211;153mFiles:\033[0m\n";
+          for f in $files; do
+            printf "  %s\n" "$f";
+          done;
+          printf "\n\033[2mThis action is permanent.\033[0m\n"
+        ' \
+        --preview-window=right:50%:wrap) || return 0
 
-  local vault_dir="$ENVOY_VAULT/$selected"
-  local file_count
-  file_count=$(find_age_files "$vault_dir" | wc -l)
+  [[ -z "$selected" ]] && return 0
 
-  msg "Project ${C_BOLD}$selected${C_RESET} has $file_count encrypted file(s)"
-  if ! ui_confirm "Remove $selected from the vault?"; then
+  local name
+  name=$(echo "$selected" | cut -d'|' -f1)
+
+  if ! ui_confirm "Remove $name from the vault?"; then
     return 0
   fi
 
-  rm -rf "$vault_dir"
+  rm -rf "$ENVOY_VAULT/$name"
   git -C "$ENVOY_VAULT" add -A
-  git -C "$ENVOY_VAULT" commit -m "clean: remove $selected" -q 2>/dev/null
+  git -C "$ENVOY_VAULT" commit -m "clean: remove $name" -q 2>/dev/null
   git -C "$ENVOY_VAULT" push -q 2>/dev/null
 
-  ui_success "Removed $selected from vault"
+  ui_success "Removed $name from vault"
 }
