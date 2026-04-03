@@ -13,6 +13,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 LIB_DIR="${ENVOY_LIB:-$SCRIPT_DIR/lib}"
+ENVOY_BIN="${BASH_SOURCE[0]}"
 
 # Load libs
 for lib in ui config vault crypto provider menu; do
@@ -32,6 +33,15 @@ if [[ "${1:-}" == "--help" || "${1:-}" == "-h" || "${1:-}" == "help" ]]; then
   show_help
   exit 0
 fi
+
+# =============================================================================
+# Internal commands (called by fzf preview, skip init check)
+# =============================================================================
+
+case "${1:-}" in
+  _hub-preview)  load_config; shift; hub_preview "$@"; exit 0 ;;
+  _list-preview) load_config; shift; list_preview "$@"; exit 0 ;;
+esac
 
 # =============================================================================
 # Init check
