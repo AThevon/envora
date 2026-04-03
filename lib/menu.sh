@@ -259,7 +259,7 @@ _menu_list() {
     [[ "$name" == ".git" ]] && continue
     local count
     count=$(find_age_files "$dir" | wc -l)
-    entries+=("${name}     │ ${C_DIM}${count} file(s)${C_RESET}")
+    entries+=("${name}│ ${C_2}◈${C_RESET}  ${name}  ${C_DIM}${count} file(s)${C_RESET}")
   done
 
   if [[ ${#entries[@]} -eq 0 ]]; then
