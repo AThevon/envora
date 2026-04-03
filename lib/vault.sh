@@ -169,8 +169,6 @@ cmd_push_vercel() {
 
 _is_vercel_project() {
   local source="$1"
-  [[ -d "$source/.vercel" ]] || npx vercel ls --token="" 2>/dev/null | grep -q "." 2>/dev/null
-  # Simple check: .vercel dir exists (linked project)
   [[ -d "$source/.vercel" ]]
 }
 
@@ -200,7 +198,15 @@ _push_vercel_files() {
   # Auto-link if needed
   if [[ ! -d "$source/.vercel" ]]; then
     msg "  Linking to Vercel..."
-    (cd "$source" && npx vercel link --yes) || { echo 0; return; }
+    if ! (cd "$source" && timeout 30 npx vercel link --yes 2>/dev/null); then
+      ui_warn "Vercel link failed or timed out"
+      echo 0; return
+    fi
+  fi
+
+  if [[ ! -d "$source/.vercel" ]]; then
+    ui_warn "Project not linked to Vercel"
+    echo 0; return
   fi
 
   mkdir -p "$vault_dir"
@@ -211,7 +217,7 @@ _push_vercel_files() {
   for env in development preview production; do
     local fname=".env.$env"
     msg "  Pulling $env..."
-    if (cd "$source" && npx vercel env pull "$tmpdir/$fname" --environment "$env" 2>/dev/null) && [[ -f "$tmpdir/$fname" ]]; then
+    if (cd "$source" && timeout 30 npx vercel env pull "$tmpdir/$fname" --environment "$env" 2>/dev/null) && [[ -f "$tmpdir/$fname" ]]; then
       encrypt_file "$tmpdir/$fname" "$vault_dir/${fname}.age"
       msg "  ${C_2}+${C_RESET} $fname"
       count=$((count + 1))
