@@ -7,7 +7,7 @@
 # All UI messages go to stderr, only paths/data go to stdout.
 # =============================================================================
 
-VERSION="0.1.0"
+VERSION="0.2.0"
 
 set -euo pipefail
 
