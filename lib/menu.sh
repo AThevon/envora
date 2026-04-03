@@ -25,10 +25,11 @@ _menu_project() {
   header=$(printf '%b' "${C_2}${name}${C_RESET}  ${C_DIM}${vault_status}${C_RESET}")
   local footer="Enter select"
 
-  local actions="push|Encrypt and save .env files to the vault|Detects .env* files in your project, encrypts them with age, and pushes to the vault repo.
+  local actions="push|Push all .env files (local + Vercel)|Pushes local .env files and, if a Vercel project is detected, offers to pull and save Vercel envs too.
+push-local|Push local .env files only|Encrypts .env* files from your project and saves them to the vault.
+push-vercel|Push Vercel env vars only|Downloads development, preview, and production env vars from Vercel, encrypts and saves to vault.
 pull|Restore .env files from the vault|Decrypts .env files from the vault and copies them into your project.
 diff|Compare local vs vault|Shows line-by-line differences between your local .env files and what's in the vault.
-vercel|Pull from Vercel|Downloads development, preview, and production env vars from Vercel, encrypts and saves to vault.
 ---|──────────────|
 list|All projects in vault|Browse all projects stored in the vault.
 clean|Remove a project from vault|Select a project to permanently remove from the vault (with confirmation).
@@ -59,14 +60,15 @@ rotate|Generate new age key|Creates a new age key, re-encrypts all vault files, 
   cmd=$(echo "$selected" | cut -d'|' -f1 | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
 
   case "$cmd" in
-    push)    cmd_push "$name" ;;
-    pull)    cmd_pull "$name" ;;
-    diff)    cmd_diff "$name" ;;
-    vercel)  cmd_vercel "$name" ;;
-    list)    _menu_list ;;
-    clean)   cmd_clean ;;
-    config)  cmd_config ;;
-    rotate)  cmd_rotate ;;
+    push)         cmd_push "$name" ;;
+    push-local)   cmd_push_local "$name" ;;
+    push-vercel)  cmd_push_vercel "$name" ;;
+    pull)         cmd_pull "$name" ;;
+    diff)         cmd_diff "$name" ;;
+    list)         _menu_list ;;
+    clean)        cmd_clean ;;
+    config)       cmd_config ;;
+    rotate)       cmd_rotate ;;
   esac
 }
 

@@ -94,19 +94,92 @@ run_init() {
   ui_success "Vault ready at $ENVOY_VAULT"
 }
 
+# Push everything: local .env files + Vercel if detected
 cmd_push() {
   local name
   name=$(resolve_project "${1:-}") || return 1
   local source
   source=$(resolve_source "$name")
-  local vault_dir="$ENVOY_VAULT/$name"
+  local total=0
 
-  local files
-  files=$(find_env_files "$source")
-  if [[ -z "$files" ]]; then
+  # 1. Push local .env files
+  local local_count
+  local_count=$(_push_local_files "$name" "$source")
+  total=$((total + local_count))
+
+  # 2. Detect Vercel and offer to push
+  if _is_vercel_project "$source"; then
+    msg ""
+    msg "  ${C_2}Vercel project detected${C_RESET}"
+    if ui_confirm "Also pull env vars from Vercel?"; then
+      local vercel_count
+      vercel_count=$(_push_vercel_files "$name" "$source")
+      total=$((total + vercel_count))
+    fi
+  fi
+
+  if [[ $total -eq 0 ]]; then
+    ui_warn "No .env files found"
+    return 1
+  fi
+
+  _vault_commit_push "push: $name ($total files)"
+  ui_success "Pushed $total file(s) for $name"
+}
+
+# Push only local .env files
+cmd_push_local() {
+  local name
+  name=$(resolve_project "${1:-}") || return 1
+  local source
+  source=$(resolve_source "$name")
+
+  local count
+  count=$(_push_local_files "$name" "$source")
+
+  if [[ $count -eq 0 ]]; then
     ui_warn "No .env files found in $source"
     return 1
   fi
+
+  _vault_commit_push "push-local: $name ($count files)"
+  ui_success "Pushed $count local file(s) for $name"
+}
+
+# Push only Vercel env vars
+cmd_push_vercel() {
+  local name
+  name=$(resolve_project "${1:-}") || return 1
+  local source
+  source=$(resolve_source "$name")
+
+  local count
+  count=$(_push_vercel_files "$name" "$source")
+
+  if [[ $count -eq 0 ]]; then
+    ui_warn "No env vars pulled from Vercel"
+    return 1
+  fi
+
+  _vault_commit_push "push-vercel: $name ($count envs)"
+  ui_success "Pushed $count Vercel env(s) for $name"
+}
+
+# --- Internal helpers ---
+
+_is_vercel_project() {
+  local source="$1"
+  [[ -d "$source/.vercel" ]] || npx vercel ls --token="" 2>/dev/null | grep -q "." 2>/dev/null
+  # Simple check: .vercel dir exists (linked project)
+  [[ -d "$source/.vercel" ]]
+}
+
+_push_local_files() {
+  local name="$1" source="$2"
+  local vault_dir="$ENVOY_VAULT/$name"
+  local files
+  files=$(find_env_files "$source")
+  [[ -z "$files" ]] && echo 0 && return
 
   mkdir -p "$vault_dir"
   local count=0
@@ -117,12 +190,42 @@ cmd_push() {
     msg "  ${C_2}+${C_RESET} $fname"
     count=$((count + 1))
   done <<< "$files"
+  echo "$count"
+}
 
+_push_vercel_files() {
+  local name="$1" source="$2"
+  local vault_dir="$ENVOY_VAULT/$name"
+
+  # Auto-link if needed
+  if [[ ! -d "$source/.vercel" ]]; then
+    msg "  Linking to Vercel..."
+    (cd "$source" && npx vercel link --yes) || { echo 0; return; }
+  fi
+
+  mkdir -p "$vault_dir"
+  local tmpdir
+  tmpdir=$(mktemp -d)
+  local count=0
+
+  for env in development preview production; do
+    local fname=".env.$env"
+    msg "  Pulling $env..."
+    if (cd "$source" && npx vercel env pull "$tmpdir/$fname" --environment "$env" 2>/dev/null) && [[ -f "$tmpdir/$fname" ]]; then
+      encrypt_file "$tmpdir/$fname" "$vault_dir/${fname}.age"
+      msg "  ${C_2}+${C_RESET} $fname"
+      count=$((count + 1))
+    fi
+  done
+  rm -rf "$tmpdir"
+  echo "$count"
+}
+
+_vault_commit_push() {
+  local message="$1"
   git -C "$ENVOY_VAULT" add -f -A
-  git -C "$ENVOY_VAULT" commit -m "push: $name ($count files)" -q 2>/dev/null
+  git -C "$ENVOY_VAULT" commit -m "$message" -q 2>/dev/null
   git -C "$ENVOY_VAULT" push -q 2>/dev/null
-
-  ui_success "Pushed $count file(s) for $name"
 }
 
 cmd_pull() {

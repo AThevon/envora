@@ -52,16 +52,17 @@ fi
 # =============================================================================
 
 case "${1:-}" in
-  init)    run_init ;;
-  push)    cmd_push "${2:-}" ;;
-  pull)    cmd_pull "${2:-}" ;;
-  diff)    cmd_diff "${2:-}" ;;
-  list)    cmd_list ;;
-  vercel)  cmd_vercel "${2:-}" ;;
-  rotate)  cmd_rotate ;;
-  config)  cmd_config ;;
-  clean)   cmd_clean ;;
-  "")      cmd_interactive ;;
+  init)         run_init ;;
+  push)         cmd_push "${2:-}" ;;
+  push-local)   cmd_push_local "${2:-}" ;;
+  push-vercel)  cmd_push_vercel "${2:-}" ;;
+  pull)         cmd_pull "${2:-}" ;;
+  diff)         cmd_diff "${2:-}" ;;
+  list)         cmd_list ;;
+  rotate)       cmd_rotate ;;
+  config)       cmd_config ;;
+  clean)        cmd_clean ;;
+  "")           cmd_interactive ;;
   *)
     ui_error "Unknown command: $1"
     msg "Run 'ev help' for usage"

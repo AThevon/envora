@@ -88,12 +88,13 @@ ev
 | Command | Description |
 |---------|-------------|
 | `ev` | Interactive mode (context-aware) |
-| `ev push [project]` | Encrypt and save .env files to the vault |
+| `ev push [project]` | Push all .env files (local + Vercel if detected) |
+| `ev push-local [project]` | Push only local .env files |
+| `ev push-vercel [project]` | Push only Vercel env vars |
 | `ev pull [project]` | Decrypt and restore .env files from the vault |
 | `ev diff [project]` | Compare local .env files with the vault |
 | `ev list` | List all projects in the vault |
 | `ev clean` | Remove a project from the vault |
-| `ev vercel [project]` | Pull env vars from Vercel |
 | `ev rotate` | Generate new age key and re-encrypt vault |
 | `ev config` | View and edit settings |
 | `ev init` | First-time setup |
