@@ -353,11 +353,9 @@ cmd_clean() {
     local name
     name=$(basename "$dir")
     [[ "$name" == ".git" ]] && continue
-    local files
-    files=$(find_age_files "$dir" | xargs -I{} basename {} .age 2>/dev/null | tr '\n' ' ')
     local count
     count=$(find_age_files "$dir" | wc -l)
-    entries+=("${name}|${count} file(s)|${files}")
+    entries+=("${name}│ ${C_1}✕${C_RESET}  ${name}  ${C_DIM}${count} file(s)${C_RESET}")
   done
 
   if [[ ${#entries[@]} -eq 0 ]]; then
@@ -365,8 +363,9 @@ cmd_clean() {
     return 0
   fi
 
+  local ev_bin="${ENVOY_BIN:-$0}"
   local header
-  header=$(printf '%b' "${C_1}clean${C_RESET}  ${C_DIM}select project to remove${C_RESET}")
+  header=$(printf '%b' "${C_1}clean${C_RESET} │ ${C_DIM}select project to remove${C_RESET}")
 
   local selected
   selected=$(printf '%s\n' "${entries[@]}" | \
@@ -374,26 +373,17 @@ cmd_clean() {
         --layout=reverse \
         --border \
         --ansi \
+        --no-sort \
         --header="$header" \
-        --delimiter='|' \
-        --with-nth=1 \
-        --preview='
-          name=$(echo {} | cut -d"|" -f1);
-          count=$(echo {} | cut -d"|" -f2);
-          files=$(echo {} | cut -d"|" -f3);
-          printf "\033[1m%s\033[0m\n%s\n\n" "$name" "$count";
-          printf "\033[38;2;52;211;153mFiles:\033[0m\n";
-          for f in $files; do
-            printf "  %s\n" "$f";
-          done;
-          printf "\n\033[2mThis action is permanent.\033[0m\n"
-        ' \
-        --preview-window=right:50%:wrap) || return 0
+        --preview "bash '$ev_bin' _list-preview {1}" \
+        --preview-window=right:50%:wrap \
+        --delimiter "│" \
+        --with-nth 2..) || return 0
 
   [[ -z "$selected" ]] && return 0
 
   local name
-  name=$(echo "$selected" | cut -d'|' -f1)
+  name="$(echo "$selected" | awk -F'│' '{gsub(/^[ \t]+|[ \t]+$/, "", $1); print $1}')"
 
   if ! ui_confirm "Remove $name from the vault?"; then
     return 0
