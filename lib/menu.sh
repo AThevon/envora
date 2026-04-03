@@ -34,6 +34,7 @@ _menu_project() {
     "push-vercel│ ${C_2}▲${C_RESET}  Push Vercel"
     "pull       │ ${C_2}↓${C_RESET}  Pull"
     "diff       │ ${C_2}◈${C_RESET}  Diff"
+    "───────────│──────────────────────────"
     "list       │ ${C_DIM}☰${C_RESET}  Browse vault"
     "clean      │ ${C_DIM}✕${C_RESET}  Clean"
     "config     │ ${C_DIM}⚙${C_RESET}  Config"
