@@ -169,9 +169,12 @@ fi
 
 case "$CMD" in
   "")
-    if is_interactive && has fzf; then
+    if is_interactive && has fzf && fzf_recent; then
       cmd_menu
     else
+      if is_interactive && has fzf; then
+        warn "the menu needs fzf $FZF_MIN or newer (you have $(fzf_version)): upgrade fzf; here is the help"
+      fi
       show_help ""
     fi
     ;;

@@ -5,6 +5,23 @@
 # Actions run as a child "ev <command>" process, so each one has its own
 # cleanup and exit code; then the menu comes back.
 
+FZF_MIN="0.59"
+
+fzf_version() {
+  fzf --version 2>/dev/null | awk '{print $1; exit}'
+}
+
+# True when fzf is recent enough for the menu (--no-input, load:pos...).
+fzf_recent() {
+  local v maj min
+  v="$(fzf_version)"
+  maj="${v%%.*}"
+  min="${v#*.}"
+  min="${min%%.*}"
+  case "$maj$min" in ''|*[!0-9]*) return 1 ;; esac
+  [[ $maj -gt 0 || $min -ge 59 ]]
+}
+
 FZF_COLORS="fg:#c5cbd3,fg+:#e6e9ed,bg+:#1f2328,hl:#6fcf7c,hl+:#6fcf7c,pointer:#6fcf7c,prompt:#6fcf7c,header:#808894,border:#3a3f46,label:#6fcf7c,info:#808894,separator:#3a3f46,scrollbar:#3a3f46,preview-border:#3a3f46,preview-label:#808894"
 
 # Run "ev ARGS..." as a child process. Never exits the menu.

@@ -16,13 +16,41 @@ doc_warn() {
 }
 doc_info() { out "  ${C_DIM}· $1${C_RST}"; }
 
+# Every encrypted file must open with the current key.
+doctor_decrypt_all() {
+  local f rel total=0 old=() lost=()
+  load_identities
+  while IFS= read -r f; do
+    [[ -z "$f" ]] && continue
+    total=$((total + 1))
+    decrypts_with_key "$f" && continue
+    rel="${f#"$ENVORA_VAULT"/}"
+    if age -d "${ID_ARGS[@]}" "$f" >/dev/null 2>&1; then
+      old[${#old[@]}]="$rel"
+    else
+      lost[${#lost[@]}]="$rel"
+    fi
+  done < <(find "$ENVORA_VAULT" -type f -name '*.age' ! -path '*/.git/*' 2>/dev/null)
+  if [[ ${#lost[@]} -gt 0 ]]; then
+    doc_bad "$(plural ${#lost[@]} file) open with none of your keys: $(short_list 3 "${lost[@]}")" "import the key they were saved with (ev init --import-key), or take them from git history"
+  fi
+  if [[ ${#old[@]} -gt 0 ]]; then
+    doc_warn "$(plural ${#old[@]} file) still encrypted for an old key: $(short_list 3 "${old[@]}")" "ev rotate (re-encrypts them for the current key)"
+  fi
+  if [[ ${#lost[@]} -eq 0 && ${#old[@]} -eq 0 && $total -gt 0 ]]; then
+    doc_ok "all $(plural "$total" "encrypted file") open with your key"
+  fi
+}
+
 cmd_doctor() {
   [[ $# -eq 0 ]] || { err "usage: ev doctor"; return 1; }
   DOCTOR_FAIL=0
   local t
   out "${C_BOLD}tools${C_RST}"
   for t in age age-keygen git jq fzf gum; do
-    if has "$t"; then
+    if [[ "$t" == fzf ]] && has fzf && ! fzf_recent; then
+      doc_warn "fzf $(fzf_version) is too old for the menu (needs $FZF_MIN or newer)" "upgrade fzf (brew upgrade fzf / nix)"
+    elif has "$t"; then
       doc_ok "$t"
     else
       case "$t" in
@@ -62,7 +90,7 @@ cmd_doctor() {
       if [[ $key_ok == 1 && "$rec" == "$KEY_PUB" ]]; then
         doc_ok "your key matches the vault (.recipient)"
       elif [[ $key_ok == 1 ]]; then
-        doc_bad "your key does NOT match the vault (.recipient)" "import the key this vault was made with: ev init"
+        doc_bad "your key does NOT match the vault (.recipient)" "ev init --import-key (the key was rotated elsewhere, or this machine made its own)"
       fi
     else
       doc_info "no .recipient yet (written by the next save)"
@@ -87,6 +115,7 @@ cmd_doctor() {
     if [[ -n "$(vgit status --porcelain 2>/dev/null)" ]]; then
       doc_warn "uncommitted changes in the vault" "ev sync"
     fi
+    [[ $key_ok == 1 ]] && doctor_decrypt_all
   fi
 
   if detect_current_project 2>/dev/null; then
@@ -109,6 +138,13 @@ cmd_doctor() {
     [[ $n -eq 0 ]] && doc_info "no env files in this project"
     if vault_exists && [[ $key_ok == 1 && -d "$ENVORA_VAULT/$PROJECT_NAME" ]]; then
       check_origin "$PROJECT_NAME" >/dev/null 2>&1 || doc_bad "the vault entry '$PROJECT_NAME' belongs to another repository" "ev save --as <other-name>"
+      local legacy
+      for legacy in .env.development .env.preview .env.production; do
+        [[ -f "$ENVORA_VAULT/$PROJECT_NAME/$legacy.age" ]] || continue
+        is_legacy_vercel_copy "$legacy" || continue
+        doc_warn "vault/$PROJECT_NAME/$legacy is a Vercel snapshot saved by envora 0.x: restore writes it into the project, where Next.js loads it" \
+          "ev import vercel (snapshots now live apart, in @vercel/), then ev forget $PROJECT_NAME $legacy"
+      done
     fi
   fi
 
