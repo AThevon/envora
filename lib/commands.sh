@@ -309,6 +309,9 @@ cmd_save() {
   if [[ -n "$tracked" ]]; then
     say "${C_DIM}skipped (tracked by git, git already has them): $(printf '%s' "$tracked" | tr '\n' ' ')${C_RST}"
   fi
+  if [[ -s "$TMP_ROOT/scan.ignored" ]]; then
+    say "${C_DIM}skipped (.envoraignore): $(tr '\n' ' ' <"$TMP_ROOT/scan.ignored")${C_RST}"
+  fi
   if [[ -n "$vaultonly" ]]; then
     while IFS= read -r rel; do
       say "${C_DIM}kept in the vault, missing here: $rel (remove with: ev forget $PROJECT_NAME $rel)${C_RST}"
@@ -366,9 +369,9 @@ cmd_save() {
   scan_unreached "$PROJECT_DIR"
   if [[ -s "$TMP_ROOT/scan.unreached" ]]; then
     while IFS= read -r rel; do
-      warn "NOT saved: $rel (envora scans 4 levels deep and skips build/, dist/, vendor/...)"
+      warn "NOT saved: $rel (envora scans 4 levels deep and skips build/ and dist/)"
     done <"$TMP_ROOT/scan.unreached"
-    err "$(plural "$(grep -c . "$TMP_ROOT/scan.unreached")" "env file") of this folder NOT in the vault: do not delete it yet"
+    err "$(plural "$(grep -c . "$TMP_ROOT/scan.unreached")" "env file") of this folder NOT in the vault: do not delete it yet. Move it up, delete it, or list it in .envoraignore to skip it"
     return 1
   fi
   if [[ $n_skipped -gt 0 ]]; then

@@ -254,7 +254,30 @@ detect_current_project() {
 
 # --- file discovery ----------------------------------------------------------
 
-# scan_project DIR -> writes $TMP_ROOT/scan.files (handled) and scan.tracked
+# .envoraignore at the project root: one pattern per line ("#" comments),
+# relative to the project, "*" matches anything ("dist/", "*/fixtures/*",
+# "legacy/.env"). Matching env files are neither saved nor reported.
+envora_ignored() {
+  local dir="$1" rel="$2" f="$1/.envoraignore" pat
+  [[ -f "$f" ]] || return 1
+  while IFS= read -r pat || [[ -n "$pat" ]]; do
+    pat="${pat%$'\r'}"
+    pat="${pat#"${pat%%[![:space:]]*}"}"
+    pat="${pat%"${pat##*[![:space:]]}"}"
+    [[ -z "$pat" || "$pat" == \#* ]] && continue
+    pat="${pat#/}"
+    pat="${pat%/}"
+    [[ -z "$pat" ]] && continue
+    # shellcheck disable=SC2053  # the pattern is a glob on purpose
+    if [[ "$rel" == $pat || "$rel" == */$pat || "$rel" == $pat/* || "$rel" == */$pat/* ]]; then
+      return 0
+    fi
+  done <"$f"
+  return 1
+}
+
+# scan_project DIR -> writes $TMP_ROOT/scan.files (handled), scan.tracked,
+# scan.ignored (.envoraignore)
 scan_project() {
   local dir="$1" f rel prune_expr=() d
   for d in $PRUNE_DIRS; do
@@ -263,6 +286,7 @@ scan_project() {
     prune_expr[${#prune_expr[@]}]="$d"
   done
   : >"$TMP_ROOT/scan.all"
+  : >"$TMP_ROOT/scan.ignored"
   find "$dir" -maxdepth "$SCAN_DEPTH" \
     \( -type d \( "${prune_expr[@]}" \) -prune \) -o \
     \( -type f -o -type l \) \
@@ -271,6 +295,10 @@ scan_project() {
       rel="${f#"$dir"/}"
       is_env_name "${rel##*/}" || continue
       [[ -f "$f" ]] || continue
+      if envora_ignored "$dir" "$rel"; then
+        printf '%s\n' "$rel" >>"$TMP_ROOT/scan.ignored"
+        continue
+      fi
       printf '%s\n' "$rel"
     done | LC_ALL=C sort -u >"$TMP_ROOT/scan.all"
 
@@ -320,12 +348,14 @@ vault_projects() {
 }
 
 # Env files the scan does not reach: deeper than $SCAN_DEPTH levels, or inside
-# build/, dist/, vendor/. Generated caches (.next, .vercel...) are ignored.
+# build/ or dist/. Dependencies (node_modules, vendor) and generated caches
+# (.next, .vercel...) hold no secrets of yours: ignored. So is whatever
+# .envoraignore lists.
 # Writes $TMP_ROOT/scan.unreached (relpaths, not tracked by git).
 scan_unreached() {
   local dir="$1" rel
   : >"$TMP_ROOT/scan.unreached"
-  find "$dir" \( -type d \( -name .git -o -name node_modules -o -name .next -o -name .nuxt \
+  find "$dir" \( -type d \( -name .git -o -name node_modules -o -name vendor -o -name .next -o -name .nuxt \
     -o -name .output -o -name .vercel -o -name .turbo -o -name .wrangler -o -name .venv \
     -o -name venv -o -name target -o -name coverage \) -prune \) -o \
     \( -type f -o -type l \) \
@@ -335,6 +365,7 @@ scan_unreached() {
       is_env_name "${rel##*/}" || continue
       [[ -f "$dir/$rel" ]] || continue
       grep -Fxq -- "$rel" "$TMP_ROOT/scan.all" 2>/dev/null && continue
+      envora_ignored "$dir" "$rel" && continue
       if [[ $PROJECT_IS_GIT == 1 ]] && git --literal-pathspecs -C "$dir" ls-files --error-unmatch -- "$rel" >/dev/null 2>&1; then
         continue
       fi

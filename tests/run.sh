@@ -1939,6 +1939,27 @@ HOOK
   assert_eq "$(cat "$ENVORA_VAULT/app/.origin")" "git@github.com:me/app.git"
 }
 
+t_envoraignore_and_dependency_dirs() {
+  local p
+  p="$(mkproject php)"
+  mkdir -p "$p/vendor/vlucas/phpdotenv/tests/fixtures/env" "$p/build" "$p/fixtures"
+  printf 'FOO=bar\n' >"$p/vendor/vlucas/phpdotenv/tests/fixtures/env/.env"
+  printf 'A=1\n' >"$p/.env"
+  cd "$p"
+  # a dependency's fixture never blocks the wipe hook
+  expect_rc 0 save -y -q
+  # a copy in build/ does, with a way out
+  printf 'COPY=1\n' >"$p/build/.env"
+  expect_rc 1 save -y -q
+  assert_contains "$OUT" "NOT saved: build/.env"
+  assert_contains "$OUT" ".envoraignore"
+  printf '# copies made by the build\nbuild/\nfixtures/*\n' >"$p/.envoraignore"
+  printf 'F=1\n' >"$p/fixtures/.env.test"
+  expect_rc 0 save -y
+  assert_contains "$OUT" "skipped (.envoraignore): fixtures/.env.test"
+  assert_no_file "$ENVORA_VAULT/php/fixtures/.env.test.age"
+}
+
 # --- run ---------------------------------------------------------------------
 
 echo "envora tests · $("$TEST_BASH" -c 'echo "bash $BASH_VERSION"') · $(age --version)"
