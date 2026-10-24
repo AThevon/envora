@@ -35,7 +35,7 @@ provider_cmd() {
     esac
     local w
     set -f
-    for w in $override; do PCMD[${#PCMD[@]}]="$w"; done
+    for w in $(expand_cmd "$override"); do PCMD[${#PCMD[@]}]="$w"; done
     set +f
   elif has "$tool"; then
     PCMD=("$tool")
@@ -129,16 +129,30 @@ EOF
   return 1
 }
 
+# local_vs_vault REL -> same | stale (the vault is newer) | edited (the local
+# copy has changes the vault does not) | none (no local copy)
+local_vs_vault() {
+  local rel="$1"
+  [[ -f "$PROJECT_DIR/$rel" ]] || { printf 'none'; return 0; }
+  same_plaintext "$ENVORA_VAULT/$PROJECT_NAME/$rel.age" "$PROJECT_DIR/$rel" && { printf 'same'; return 0; }
+  if [[ "$(classify_change "$rel")" == stale ]]; then printf 'stale'; else printf 'edited'; fi
+}
+
 # Warn when the project file differs from the vault copy. Returns 1 to stop.
 warn_if_local_differs() {
-  local rel="$1" vf="$ENVORA_VAULT/$PROJECT_NAME/$1.age"
-  [[ -f "$PROJECT_DIR/$rel" ]] || return 0
-  same_plaintext "$vf" "$PROJECT_DIR/$rel" && return 0
-  warn "your local $rel differs from the vault copy ($(key_diff_line "$rel")). Save first? (ev save)"
-  if is_interactive; then
-    vault_release
-    confirm "Continue with the vault version?" || return 1
-  fi
+  local rel="$1"
+  case "$(local_vs_vault "$rel")" in
+    stale)
+      warn "the vault has a newer $rel than your local file ($(key_diff_line "$rel")): the vault version is what gets sent (ev restore brings it here)"
+      ;;
+    edited)
+      warn "your local $rel has changes the vault does not have ($(key_diff_line "$rel")): only the vault version is sent. Save first? (ev save)"
+      if is_interactive; then
+        vault_release
+        confirm "Continue with the vault version?" || return 1
+      fi
+      ;;
+  esac
   return 0
 }
 
@@ -198,17 +212,37 @@ cmd_export() {
   esac
 }
 
-# Shared option parsing for provider commands: --env --file --dry-run
-# (--update-shared: export vercel only)
-P_ENV="" P_FILE="" P_DRY=0 P_SHARED=0
+# Shared option parsing for provider commands. The second argument lists the
+# options this command accepts (others are refused, never silently ignored):
+#   --env --file --dry-run --update-shared (+ --as and --force everywhere)
+# P_ENV_SET is 1 when --env was given, even empty (--env= : no environment).
+P_ENV="" P_ENV_SET=0 P_FILE="" P_DRY=0 P_SHARED=0
 parse_provider_args() {
-  local cmd="$1"
-  shift
-  P_ENV="" P_FILE="" P_DRY=0 P_SHARED=0
+  local cmd="$1" allowed=" $2 --as --force " opt
+  shift 2
+  P_ENV="" P_ENV_SET=0 P_FILE="" P_DRY=0 P_SHARED=0
   while [[ $# -gt 0 ]]; do
     case "$1" in
-      --env|-e) [[ $# -ge 2 ]] || { err "--env needs a value"; return 1; }; P_ENV="$2"; shift ;;
-      --env=*) P_ENV="${1#--env=}" ;;
+      --env|-e|--env=*) opt=--env ;;
+      --file|-f|--file=*) opt=--file ;;
+      --dry-run|-n) opt=--dry-run ;;
+      --as|--as=*) opt=--as ;;
+      *) opt="$1" ;;
+    esac
+    case "$allowed" in
+      *" $opt "*) ;;
+      *)
+        case "$opt" in
+          --dry-run) err "--dry-run is not used by $cmd: it only writes to the vault, never to your files or the platform" ;;
+          --file) err "--file is not used by $cmd" ;;
+          *) err "unknown option for $cmd: $1 (see: ev help $cmd)" ;;
+        esac
+        return 1
+        ;;
+    esac
+    case "$1" in
+      --env|-e) [[ $# -ge 2 ]] || { err "--env needs a value"; return 1; }; P_ENV="$2"; P_ENV_SET=1; shift ;;
+      --env=*) P_ENV="${1#--env=}"; P_ENV_SET=1 ;;
       --file|-f) [[ $# -ge 2 ]] || { err "--file needs a value"; return 1; }; P_FILE="$2"; shift ;;
       --file=*) P_FILE="${1#--file=}" ;;
       --dry-run|-n) P_DRY=1 ;;
@@ -216,7 +250,6 @@ parse_provider_args() {
       --as) [[ $# -ge 2 ]] || { err "--as needs a name"; return 1; }; ARG_AS="$2"; shift ;;
       --as=*) ARG_AS="${1#--as=}" ;;
       --force) ARG_FORCE=1 ;;
-      *) err "unknown option for $cmd: $1 (see: ev help $cmd)"; return 1 ;;
     esac
     shift
   done
@@ -224,8 +257,9 @@ parse_provider_args() {
     require_valid_name "$ARG_AS" || return 1
   fi
   if [[ -n "$P_ENV" ]]; then
-    local re='^[A-Za-z0-9._-]+$'
-    [[ "$P_ENV" =~ $re ]] || { err "invalid environment name: $P_ENV"; return 1; }
+    # Never starts with "-": it is passed to vercel / wrangler.
+    local re='^[A-Za-z0-9_][A-Za-z0-9._-]*$'
+    [[ "$P_ENV" =~ $re && "$P_ENV" != *..* ]] || { err "invalid environment name: $P_ENV"; return 1; }
   fi
   if [[ -n "$P_FILE" ]]; then
     P_FILE="${P_FILE#./}"

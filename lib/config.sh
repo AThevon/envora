@@ -27,6 +27,15 @@ expand_path() {
   printf '%s' "$v"
 }
 
+# A command setting: a leading ~ in its first word is expanded (it is never
+# run through a shell, so nothing else would expand it).
+expand_cmd() {
+  local v="$1" first rest=""
+  first="${v%% *}"
+  [[ "$v" == *" "* ]] && rest=" ${v#* }"
+  printf '%s%s' "$(expand_path "$first")" "$rest"
+}
+
 # Read a value the way a shell would read a word: '...' literal, "..." with
 # \" \\ \$ \` escapes, backslash escapes outside quotes, pieces glued
 # together, a " # comment" after the value ignored. Nothing is ever executed.
@@ -212,6 +221,15 @@ config_validate() {
         return 1
       fi
       ;;
+    ENVORA_VERCEL_CMD|ENVORA_WRANGLER_CMD)
+      case "$val" in
+        *\"*|*\'*|*\\*)
+          err "$var: quotes and backslashes are not supported (words are split on spaces)"
+          say "  put the command in a small script and point the setting at it"
+          return 1
+          ;;
+      esac
+      ;;
   esac
   return 0
 }
@@ -222,6 +240,7 @@ config_set() {
   val="$2"
   case "$var" in
     ENVORA_VAULT|ENVORA_KEY|ENVORA_PROJECTS) val="$(expand_path "$val")" ;;
+    ENVORA_VERCEL_CMD|ENVORA_WRANGLER_CMD) val="$(expand_cmd "$val")" ;;
   esac
   config_validate "$var" "$val" || return 1
   printf -v "$var" '%s' "$val"
@@ -231,6 +250,22 @@ config_set() {
   if [[ -n "$(eval "printf '%s' \"\${_ENV_SET_$var:-}\"")" ]]; then
     warn "$var is also set in your environment: that value wins while it is set"
   fi
+  case "$var" in
+    ENVORA_VERCEL_CMD|ENVORA_WRANGLER_CMD)
+      local first="${val%% *}"
+      if [[ -n "$first" ]] && ! has "$first"; then
+        warn "$first is not an executable command here (not on PATH): check the setting"
+      fi
+      ;;
+    ENVORA_REPO)
+      local url=""
+      vault_exists && url="$(vgit remote get-url origin 2>/dev/null || true)"
+      if [[ -n "$url" ]]; then
+        warn "ENVORA_REPO is only used by ev init: this vault syncs with $(sanitize_origin "$url")"
+        say "  to move the vault to another repo: git -C $(tildify "$ENVORA_VAULT") remote set-url origin <url>"
+      fi
+      ;;
+  esac
 }
 
 config_describe() {
@@ -238,7 +273,7 @@ config_describe() {
     ENVORA_VAULT) echo "Vault: the local git repo holding the encrypted copies" ;;
     ENVORA_KEY) echo "Key: your age private key (keep a copy in a password manager)" ;;
     ENVORA_PROJECTS) echo "Projects: where 'ev restore NAME' looks for NAME" ;;
-    ENVORA_REPO) echo "GitHub repo of the vault (user/name)" ;;
+    ENVORA_REPO) echo "GitHub repo used by ev init to clone or create the vault (the vault then syncs with its own git remote)" ;;
     ENVORA_VERCEL_CMD) echo "Command used for Vercel (default: vercel, else npx); words split on spaces, no quotes" ;;
     ENVORA_WRANGLER_CMD) echo "Command used for Cloudflare (default: wrangler, else npx); words split on spaces, no quotes" ;;
   esac

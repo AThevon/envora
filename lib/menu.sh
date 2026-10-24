@@ -598,23 +598,31 @@ preview_export_cloudflare() {
     target="Worker ${CF_NAME:-?} (deployed, top-level)"
     [[ "$CF_PAGES" == 1 ]] && target="Pages project ${CF_NAME:-?} (production)"
     out "  $(cf_kind) ${C_BOLD}${CF_NAME:-?}${C_RST}  ${C_DIM}$(in_dir "$reldir" "$(basename "$CF_CFG")")${C_RST}"
+    local saved e f
+    saved="$(cf_saved_envs "$reldir" "$CF_PAGES")"
     if file="$(cf_source_file "$reldir" "")"; then
       keys="$(decrypt_stream "$ENVORA_VAULT/$PROJECT_NAME/$file.age" 2>/dev/null | dotenv_keys | tr '\n' ' ')"
       out "    vault/$PROJECT_NAME/$file ${C_ACC}→${C_RST} $target"
       out "    ${C_DIM}secrets: $keys${C_RST}"
-      if [[ -f "$PROJECT_DIR/$file" ]] && ! same_plaintext "$ENVORA_VAULT/$PROJECT_NAME/$file.age" "$PROJECT_DIR/$file"; then
-        out "    ${C_WARN}! your local $file differs from the vault: save first?${C_RST}"
-      fi
-    else
+      case "$(local_vs_vault "$file")" in
+        edited) out "    ${C_WARN}! your local $file has changes the vault does not have: save first?${C_RST}" ;;
+        stale) out "    ${C_DIM}the vault has a newer $file than your local file: the vault version is sent${C_RST}" ;;
+      esac
+    elif [[ -z "$saved" ]]; then
       out "    ${C_WARN}no $(in_dir "$reldir" .dev.vars) or $(in_dir "$reldir" .env) saved in the vault: save first${C_RST}"
+    else
+      out "    ${C_DIM}no $(in_dir "$reldir" .dev.vars) for the deployed $(cf_kind): running it asks which environment${C_RST}"
     fi
+    while IFS=$'\t' read -r e f; do
+      [[ -n "$e" ]] && out "    vault/$PROJECT_NAME/$f ${C_ACC}→${C_RST} environment $e  ${C_DIM}(ev export cloudflare --env $e)${C_RST}"
+    done <<<"$saved"
   done <<<"$dirs"
   out ""
   out "${C_DIM}running it compares names with 'wrangler secret list', shows the plan and asks:"
   out "secrets deploy immediately. Values are piped, never written to disk."
   out "Nothing is deleted on Cloudflare."
   out "Without --env: .dev.vars goes to the deployed Worker (Pages: production)."
-  out "With --env e (CLI): .dev.vars.<e> goes to environment e.${C_RST}"
+  out "With --env e: .dev.vars.<e> goes to environment e.${C_RST}"
 }
 
 preview_browse() {

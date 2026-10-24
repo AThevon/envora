@@ -92,8 +92,7 @@ FILENAME == ARGV[1] {
 '
 
 vercel_import() {
-  parse_provider_args "import vercel" "$@" || return 1
-  [[ -z "$P_FILE" ]] || { err "--file is not used by import"; return 1; }
+  parse_provider_args "import vercel" "--env" "$@" || return 1
   vault_ready || return 1
   require_key || return 1
   resolve_project "" || return 1
@@ -152,7 +151,7 @@ vercel_import() {
     if [[ -f "$snap" ]] && same_plaintext "$snap" "$merged"; then
       same=$((same + 1))
       step "$env  ${C_DIM}$(plural "$n" variable), unchanged${C_RST}"
-    elif encrypt_file "$merged" "$snap"; then
+    elif vault_inflight_add "$PROJECT_NAME/$rel.age" && encrypt_file "$merged" "$snap"; then
       changed[${#changed[@]}]="$env"
       step "$env  ${C_DIM}$(plural "$n" variable) → vault/$PROJECT_NAME/$rel${C_RST}"
     else
@@ -162,8 +161,15 @@ vercel_import() {
   done
 
   if [[ ${#changed[@]} -gt 0 ]]; then
+    # The entry is claimed by this repository, as ev save would.
+    vault_inflight_add "$PROJECT_NAME/.origin"
+    save_origin_file
     vault_gitattributes
-    vault_commit "import vercel: $PROJECT_NAME ($(join_by ', ' "${changed[@]}"))" "$PROJECT_NAME" .recipient .gitattributes || true
+    local commit_rc=0
+    vault_commit "import vercel: $PROJECT_NAME ($(join_by ', ' "${changed[@]}"))" "$PROJECT_NAME" .recipient .gitattributes || commit_rc=$?
+    [[ $commit_rc == 2 ]] && return 1
+    vault_inflight_done
+    record_project_dir
   fi
   local push_rc=0
   vault_push || push_rc=$?
@@ -224,7 +230,7 @@ VERCEL_KEYS_JQ='
   | @tsv'
 
 vercel_export() {
-  parse_provider_args "export vercel" "$@" || return 1
+  parse_provider_args "export vercel" "--env --file --dry-run --update-shared" "$@" || return 1
   vault_ready || return 1
   require_key || return 1
   vault_pull || return 1
@@ -338,7 +344,8 @@ vercel_export() {
       fi
     fi
     val="$(printf '%s\n' "$recs" | jq -sj --arg k "$k" 'map(select(.k == $k)) | last | .v')"
-    len=${#val}
+    # Bytes, not characters: the Vercel CLI reads one 64 KiB chunk of stdin.
+    len="$(printf '%s' "$val" | LC_ALL=C wc -c | tr -d ' ')"
     case "$val" in
       *'$'[A-Za-z_]*|*'${'*) expands[${#expands[@]}]="$k" ;;
     esac
@@ -372,9 +379,19 @@ vercel_export() {
   [[ ${#add[@]} -gt 0 ]] && plan_line "  ${C_ACC}+ add${C_RST}      $(join_by ' ' "${add[@]}")"
   [[ ${#upd[@]} -gt 0 ]] && plan_line "  ${C_WARN}~ update${C_RST}   $(join_by ' ' "${upd[@]}")"
   [[ ${#same[@]} -gt 0 ]] && plan_line "  ${C_DIM}= same     $(join_by ' ' "${same[@]}")${C_RST}"
+  # Shared variables are only updated on an explicit yes (asked after the plan).
+  local send_shared=0
   if [[ ${#shared[@]} -gt 0 ]]; then
     plan_line "  ${C_WARN}! shared${C_RST}   $(join_by ', ' "${shared_info[@]}")"
     plan_line "             ${C_DIM}one variable on Vercel serves several environments: updating it changes them all${C_RST}"
+    if [[ $P_SHARED == 1 ]]; then
+      send_shared=1
+      plan_line "             ${C_DIM}updated anyway (--update-shared)${C_RST}"
+    elif [[ $P_DRY != 1 ]] && is_interactive; then
+      plan_line "             ${C_DIM}you will be asked whether to update them${C_RST}"
+    else
+      plan_line "             ${C_DIM}skipped: add --update-shared to update them anyway${C_RST}"
+    fi
   fi
   [[ ${#branchy[@]} -gt 0 ]] && plan_line "  ${C_WARN}! skipped${C_RST}  $(join_by ' ' "${branchy[@]}")  ${C_DIM}(also has branch-specific values: change it in the Vercel dashboard)${C_RST}"
   [[ ${#BAD_KEYS[@]} -gt 0 ]] && plan_line "  ${C_WARN}! skipped${C_RST}  $(join_by ' ' "${BAD_KEYS[@]}")  ${C_DIM}(not a valid variable name)${C_RST}"
@@ -383,17 +400,9 @@ vercel_export() {
   [[ ${#only[@]} -gt 0 ]] && plan_line "  ${C_DIM}· kept     $(join_by ' ' "${only[@]}")  (only on Vercel, never deleted)${C_RST}"
   [[ ${#expands[@]} -gt 0 ]] && plan_line "  ${C_WARN}! note${C_RST}     $(join_by ' ' "${expands[@]}")  ${C_DIM}(the value contains \$NAME: sent as written, Vercel does not expand it; Next.js does locally)${C_RST}"
 
-  # Shared variables are only updated on an explicit yes.
-  local send_shared=0
-  if [[ ${#shared[@]} -gt 0 ]]; then
-    if [[ $P_SHARED == 1 ]]; then
+  if [[ ${#shared[@]} -gt 0 && $send_shared == 0 && $P_DRY != 1 ]] && is_interactive; then
+    if confirm "Also update the shared variables ($(join_by ', ' "${shared[@]}"))? Their other environments change too." no; then
       send_shared=1
-    elif [[ $P_DRY != 1 ]] && is_interactive; then
-      if confirm "Also update the shared variables ($(join_by ', ' "${shared[@]}"))? Their other environments change too." no; then
-        send_shared=1
-      fi
-    else
-      plan_line "             ${C_DIM}skipped: add --update-shared to update them anyway${C_RST}"
     fi
   fi
   [[ $send_shared == 1 ]] && upd=(${upd[@]+"${upd[@]}"} "${shared[@]}")

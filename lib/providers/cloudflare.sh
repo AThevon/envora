@@ -149,8 +149,49 @@ cf_source_file() {
   return 1
 }
 
+# Environment named by a file: .dev.vars.<e> / .env.<e> -> e (not the
+# .local overrides wrangler also reads).
+cf_env_of_file() {
+  local b="${1##*/}" e
+  case "$b" in
+    .dev.vars.*) e="${b#.dev.vars.}" ;;
+    .env.*) e="${b#.env.}" ;;
+    *) return 1 ;;
+  esac
+  case "$e" in ''|local|*.local) return 1 ;; esac
+  printf '%s' "$e"
+}
+
+# Environments that have a saved file for the config folder RELDIR:
+# "env<TAB>file" lines, .dev.vars.<e> preferred over .env.<e> (wrangler reads
+# .env files only when there is no .dev.vars). Pages: production / preview.
+cf_saved_envs() {
+  local reldir="$1" pages="${2:-0}" f b e
+  vault_project_files "$PROJECT_NAME" | while IFS= read -r f; do
+    if [[ "$reldir" == "." ]]; then
+      [[ "$f" == */* ]] && continue
+      b="$f"
+    else
+      [[ "$f" == "$reldir/"* ]] || continue
+      b="${f#"$reldir"/}"
+      [[ "$b" == */* ]] && continue
+    fi
+    e="$(cf_env_of_file "$b")" || continue
+    if [[ "$pages" == 1 ]]; then
+      case "$e" in production|preview) ;; *) continue ;; esac
+    fi
+    printf '%s\t%s\n' "$e" "$f"
+  done | LC_ALL=C sort -t "$(printf '\t')" -k2,2 | awk -F '\t' '!seen[$1]++'
+}
+
+# Cloudflare names: a Pages project name goes on wrangler's command line.
+cf_valid_name() {
+  local re='^[A-Za-z0-9][A-Za-z0-9_-]*$'
+  [[ "$1" =~ $re ]]
+}
+
 cloudflare_export() {
-  parse_provider_args "export cloudflare" "$@" || return 1
+  parse_provider_args "export cloudflare" "--env --file --dry-run" "$@" || return 1
   vault_ready || return 1
   require_key || return 1
   vault_pull || return 1
@@ -173,28 +214,67 @@ cloudflare_export() {
   fi
   local pages="$CF_PAGES" name="$CF_NAME" cfg="$CF_CFG"
   if [[ $pages == 1 ]]; then
-    [[ -n "$name" ]] || { err "no \"name\" in $cfg: wrangler needs it for the Pages project"; return 1; }
+    [[ -n "$name" ]] || { err "no \"name\" in $(tildify "$cfg"): wrangler needs it for the Pages project"; return 1; }
+    cf_valid_name "$name" || { err "invalid Pages project name in $(tildify "$cfg"): '$name'"; return 1; }
+  fi
+
+  # --file .dev.vars.staging without --env: the file names the environment
+  # (as for Vercel). --env= (empty) sends it to the deployed Worker instead.
+  local file="$P_FILE" env_note=""
+  if [[ -n "$file" && $P_ENV_SET == 0 ]]; then
+    local fe
+    if fe="$(cf_env_of_file "$file")"; then
+      if [[ $pages == 1 && "$fe" != production && "$fe" != preview ]]; then
+        err "which environment for $file? Pages projects only have production and preview: add --env production or --env preview"
+        return 1
+      fi
+      P_ENV="$fe"
+      env_note="from the file name; --env= sends it to the $([[ $pages == 1 ]] && printf 'production' || printf 'deployed') $(cf_kind) instead"
+    fi
+  fi
+  if [[ $pages == 1 ]]; then
     case "$P_ENV" in
       ""|production|preview) ;;
       *) err "Cloudflare Pages only has the production and preview environments"; return 1 ;;
     esac
   fi
 
-  local file="$P_FILE"
   if [[ -z "$file" ]]; then
     if ! file="$(cf_source_file "$reldir" "$P_ENV")"; then
-      if [[ -n "$P_ENV" ]]; then
+      local saved
+      saved="$(cf_saved_envs "$reldir" "$pages")"
+      if [[ -z "$P_ENV" && -n "$saved" ]]; then
+        # Only per-environment files are saved (.dev.vars.production ...).
+        local items=() e f c
+        while IFS=$'\t' read -r e f; do
+          [[ -n "$e" ]] && items[${#items[@]}]="$e  ($f)"
+        done <<<"$saved"
+        if is_interactive; then
+          c="$(choose "No $(in_dir "$reldir" .dev.vars) saved. Which environment?" "${items[@]}")" || { say "cancelled"; return 1; }
+          P_ENV="${c%%  (*}"
+          file="$(printf '%s\n' "$saved" | awk -F '\t' -v e="$P_ENV" '$1 == e { print $2; exit }')"
+        else
+          err "no $(in_dir "$reldir" .dev.vars) or $(in_dir "$reldir" .env) saved for the deployed $(cf_kind), but these environments have one:"
+          while IFS=$'\t' read -r e f; do
+            [[ -n "$e" ]] && say "  $f → ev export cloudflare --env $e"
+          done <<<"$saved"
+          return 1
+        fi
+      elif [[ -n "$P_ENV" ]]; then
         err "no $(in_dir "$reldir" ".dev.vars.$P_ENV") or $(in_dir "$reldir" ".env.$P_ENV") saved in the vault"
         if cf_source_file "$reldir" "" >/dev/null; then
           say "  to send $(cf_source_file "$reldir" "") to $P_ENV instead: ev export cloudflare --env $P_ENV --file $(cf_source_file "$reldir" "")"
+        elif [[ -n "$saved" ]]; then
+          say "  saved environments: $(printf '%s\n' "$saved" | cut -f1 | tr '\n' ' ')"
         else
           say "  save your local file first (ev save), or choose one with --file"
         fi
+        return 1
       else
         err "no $(in_dir "$reldir" .dev.vars) or $(in_dir "$reldir" .env) saved in the vault for $PROJECT_NAME"
         say "  save your local file first (ev save), or choose one with --file"
+        return 1
       fi
-      return 1
     fi
   elif [[ ! -f "$ENVORA_VAULT/$PROJECT_NAME/$file.age" ]]; then
     err "$file is not in the vault for $PROJECT_NAME (save it first: ev save)"
@@ -219,7 +299,8 @@ cloudflare_export() {
   local env_args=() target_args=() target_label
   [[ -n "$P_ENV" ]] && env_args=(--env "$P_ENV")
   if [[ $pages == 1 ]]; then
-    target_args=(--project-name "$name")
+    # One argument: a name can never be read as an option.
+    target_args=("--project-name=$name")
     target_label="Pages project $name (${P_ENV:-production})"
   else
     target_args=(--config "$cfg")
@@ -231,7 +312,7 @@ cloudflare_export() {
   fi
 
   step "reading the secret names of the $target_label"
-  local remote=""
+  local remote="" undeployed=0
   if [[ $pages == 1 ]]; then
     if ! (cd "$cfdir" && "${PCMD[@]}" pages secret list "${target_args[@]}" ${env_args[@]+"${env_args[@]}"}) >"$TMP_ROOT/cfl.out" 2>"$TMP_ROOT/cfl.err"; then
       err "wrangler pages secret list failed:"
@@ -241,14 +322,20 @@ cloudflare_export() {
     remote="$(sed -n 's/^[[:space:]]*- \([^:]*\):.*/\1/p' "$TMP_ROOT/cfl.out" | LC_ALL=C sort -u)"
   else
     if ! (cd "$cfdir" && "${PCMD[@]}" secret list --format json "${target_args[@]}" ${env_args[@]+"${env_args[@]}"}) >"$TMP_ROOT/cfl.out" 2>"$TMP_ROOT/cfl.err"; then
-      err "wrangler secret list failed:"
-      show_tool_output "$TMP_ROOT/cfl.err"
-      return 1
+      # A Worker never deployed has no secrets yet: secret bulk creates it.
+      if grep -qiE 'not found|wrangler deploy|10007' "$TMP_ROOT/cfl.err" "$TMP_ROOT/cfl.out" 2>/dev/null; then
+        undeployed=1
+      else
+        err "wrangler secret list failed:"
+        show_tool_output "$TMP_ROOT/cfl.err"
+        return 1
+      fi
+    else
+      remote="$(jq -r '.[]?.name // empty' "$TMP_ROOT/cfl.out" 2>/dev/null | LC_ALL=C sort -u)" || {
+        err "unexpected output from wrangler secret list"
+        return 1
+      }
     fi
-    remote="$(jq -r '.[]?.name // empty' "$TMP_ROOT/cfl.out" 2>/dev/null | LC_ALL=C sort -u)" || {
-      err "unexpected output from wrangler secret list"
-      return 1
-    }
   fi
 
   local k add=() upd=() only=()
@@ -261,26 +348,36 @@ cloudflare_export() {
     printf '%s\n' "$keys" | grep -Fxq -- "$k" || only[${#only[@]}]="$k"
   done <<<"$remote"
 
+  local batches=$(((count + CF_BATCH - 1) / CF_BATCH))
   plan_line "${C_BOLD}vault → Cloudflare${C_RST}  ${C_DIM}vault/$PROJECT_NAME/$file → $target_label$([[ "$reldir" != "." ]] && printf ' (%s)' "$reldir")${C_RST}"
+  [[ -n "$env_note" ]] && plan_line "  ${C_DIM}environment $P_ENV: $env_note${C_RST}"
+  [[ $undeployed == 1 ]] && plan_line "  ${C_WARN}! new${C_RST}      ${C_DIM}this Worker is not deployed yet: wrangler creates it with these secrets${C_RST}"
   [[ ${#add[@]} -gt 0 ]] && plan_line "  ${C_ACC}+ add${C_RST}      $(join_by ' ' "${add[@]}")"
   [[ ${#upd[@]} -gt 0 ]] && plan_line "  ${C_WARN}~ update${C_RST}   $(join_by ' ' "${upd[@]}")  ${C_DIM}(values are write-only, so every key is sent)${C_RST}"
   [[ ${#only[@]} -gt 0 ]] && plan_line "  ${C_DIM}· kept     $(join_by ' ' "${only[@]}")  (only on Cloudflare, never deleted)${C_RST}"
   [[ ${#BAD_KEYS[@]} -gt 0 ]] && plan_line "  ${C_WARN}! skipped${C_RST}  $(join_by ' ' "${BAD_KEYS[@]}")  ${C_DIM}(not a valid variable name)${C_RST}"
+  [[ $batches -gt 1 ]] && plan_line "  ${C_DIM}sent in $batches batches of up to $CF_BATCH: each one deploys on its own${C_RST}"
   if [[ $pages == 0 && -z "$P_ENV" ]]; then
-    plan_line "  ${C_DIM}target: the deployed Worker (no --env). Another environment: --env <name>, which sends .dev.vars.<name>${C_RST}"
+    if [[ -n "$P_FILE" ]]; then
+      plan_line "  ${C_DIM}target: the deployed Worker (no --env). Another environment: add --env <name> (the same file is sent)${C_RST}"
+    else
+      plan_line "  ${C_DIM}target: the deployed Worker (no --env). Another environment: --env <name>, which sends .dev.vars.<name>${C_RST}"
+    fi
   fi
 
   if [[ $P_DRY == 1 ]]; then
     plan_line "${C_DIM}dry run: nothing sent${C_RST}"
     return 0
   fi
-  if ! confirm "Upload $(plural "$count" secret) to the $target_label? This deploys immediately."; then
+  local deploys="This deploys immediately."
+  [[ $batches -gt 1 ]] && deploys="This deploys immediately, $batches times (one per batch of $CF_BATCH)."
+  if ! confirm "Upload $(plural "$count" secret) to the $target_label? $deploys"; then
     if is_interactive; then say "cancelled"; return 0; fi
     err "refusing to deploy secrets without confirmation: add --yes"
     return 1
   fi
 
-  local json i=0 batch_rc=0
+  local json i=0 batch_rc=0 sent=0
   json="$(printf '%s\n' "$recs" | jq -sc 'map({(.k): .v}) | add // {}')" || { err "cannot build the secrets payload"; return 1; }
   while [[ $i -lt $count ]]; do
     if [[ $pages == 1 ]]; then
@@ -293,8 +390,18 @@ cloudflare_export() {
     if [[ $batch_rc -ne 0 ]]; then
       err "wrangler secret bulk failed:"
       show_tool_output "$TMP_ROOT/cfb.out"
+      if [[ $sent -gt 0 ]]; then
+        local rest=() kk
+        while IFS= read -r kk; do
+          [[ -n "$kk" ]] && rest[${#rest[@]}]="$kk"
+        done < <(printf '%s' "$json" | jq -r --argjson i "$i" 'to_entries | .[$i:] | .[].key')
+        warn "$sent of $count secrets were already uploaded and deployed by the earlier batches; not sent: $(short_list 6 "${rest[@]}"). Run it again to send them all"
+      fi
+      json=""
+      recs=""
       return 1
     fi
+    sent=$((sent + (count - i < CF_BATCH ? count - i : CF_BATCH)))
     i=$((i + CF_BATCH))
   done
   json=""

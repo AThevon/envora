@@ -165,11 +165,26 @@ for ((i = 1; i <= $#; i++)); do
 done
 case "$1 ${2:-} ${3:-}" in
   "secret list "*)
+    if [[ -f "$STUB/wrangler.listfail" ]]; then
+      # what wrangler 4.132 says for a Worker never deployed
+      echo '✘ [ERROR] A request to the Cloudflare API failed.' >&2
+      echo '  This Worker does not exist on your account. [code: 10007]' >&2
+      echo '  Worker "api" not found.' >&2
+      exit 1
+    fi
     f="$STUB/wrangler.list${env:+.$env}.json"
     [[ -f "$f" ]] && cat "$f" || echo "[]"
     ;;
   "secret bulk "*)
+    n="$(cat "$STUB/wrangler.bulkcount" 2>/dev/null || echo 0)"
+    n=$((n + 1))
+    echo "$n" >"$STUB/wrangler.bulkcount"
     cat >"$STUB/wrangler.stdin"
+    cp "$STUB/wrangler.stdin" "$STUB/wrangler.stdin.$n"
+    if [[ -f "$STUB/wrangler.bulkfail.$n" ]]; then
+      echo "✘ A request to the Cloudflare API failed" >&2
+      exit 1
+    fi
     echo "Successfully uploaded secrets"
     ;;
   "pages secret list")
@@ -1098,6 +1113,14 @@ EOF
   assert_contains "$plain" 'PUBLIC_URL="https://example.com"'
   assert_eq "$(cat "$p/.env.production")" "LOCAL=keep" "project files untouched"
   assert_no_file "$ENVORA_VAULT/web/.env.production.age"
+  # the entry is claimed by this repository, as a save would
+  assert_eq "$(cat "$ENVORA_VAULT/web/.origin")" "git@github.com:me/web.git"
+  # options import does not use are refused, never ignored
+  expect_rc 1 import vercel --dry-run
+  assert_contains "$OUT" "--dry-run is not used by import vercel"
+  expect_rc 1 import vercel --update-shared
+  expect_rc 1 import vercel --env=--debug
+  assert_contains "$OUT" "invalid environment name"
   # a Secret (write-only) exists on Vercel: never reported as missing there
   printf 'API_KEY=local\nPUBLIC_URL="https://example.com"\n' >"$p/.env.production"
   expect_rc 0 status
@@ -1185,7 +1208,7 @@ t_export_cloudflare_stub() {
   # local file differs from the vault: warned
   printf 'API_TOKEN=newer\n' >"$p/apps/edge/.dev.vars"
   expect_rc 0 export cloudflare --dry-run
-  assert_contains "$OUT" "differs from the vault copy"
+  assert_contains "$OUT" "your local apps/edge/.dev.vars has changes the vault does not have"
   # a dotenv key that looks like an option never reaches the wrangler argv
   # or the payload; KEY: value lines are read like dotenv does
   printf -- '--scope=evil\nGOOD=1\nCOLON: yes\n' >"$p/apps/edge/.dev.vars"
@@ -1207,7 +1230,7 @@ t_export_cloudflare_pages() {
   expect_rc 0 export cloudflare --yes
   assert_contains "$OUT" "kept     OLD_SECRET"
   assert_contains "$OUT" "Pages project site (production)"
-  assert_contains "$(tail -n 1 "$STUB/wrangler.log")" "pages secret bulk --project-name site (cwd=$p)"
+  assert_contains "$(tail -n 1 "$STUB/wrangler.log")" "pages secret bulk --project-name=site (cwd=$p)"
   assert_eq "$(jq -c . "$STUB/wrangler.stdin")" '{"S":"1"}'
   # the name wrangler will use: comments, nested names and trailing commas ignored
   printf '{\n  "$schema": "https://x/schema.json", // "name": "old-site",\n  /* "name": "older" */\n  "name": "real-site",\n  "vars": {"name": "nope",},\n  "pages_build_output_dir": "./dist",\n}\n' >"$p/wrangler.jsonc"
@@ -1342,7 +1365,8 @@ EOF
   expect_rc 0 save
   expect_rc 0 export vercel --env development --yes
   assert_contains "$OUT" "! shared   DATABASE_URL (also production, preview)"
-  assert_contains "$OUT" "--update-shared"
+  assert_contains "$OUT" "updating it changes them all
+             skipped: add --update-shared to update them anyway"
   assert_contains "$OUT" "PREV_BRANCHY  (also has branch-specific values"
   assert_contains "$OUT" "EMPTY  (empty value"
   assert_contains "$(cat "$STUB/vercel.stdin")" "update development OWN=1"
@@ -2326,6 +2350,106 @@ EOF
   assert_contains "$OUT" "line 2: unknown setting ENVORA_VAULTT"
   assert_contains "$OUT" "wrangler"
   assert_eq "$("$TEST_BASH" "$EV" config get wrangler-cmd 2>/dev/null)" "wrangler"
+}
+
+t_export_cloudflare_environments_and_batches() {
+  local p i keys=""
+  p="$(mkproject cfenv)"
+  printf 'name = "api"\n\n[env.production]\n\n[env.staging]\n' >"$p/wrangler.toml"
+  printf 'K=prod\n' >"$p/.dev.vars.production"
+  printf 'K=staging\n' >"$p/.dev.vars.staging"
+  cd "$p"
+  expect_rc 0 save -q -y
+  # only per-environment files: the CLI says which ones, the preview lists them
+  expect_rc 1 export cloudflare --yes
+  assert_contains "$OUT" ".dev.vars.production → ev export cloudflare --env production"
+  assert_contains "$OUT" ".dev.vars.staging → ev export cloudflare --env staging"
+  OUT="$(ENVORA_MENU_DIR="$p" "$TEST_BASH" "$EV" _preview export-cloudflare 2>&1)"
+  assert_contains "$OUT" "vault/cfenv/.dev.vars.staging → environment staging"
+  assert_not_contains "$OUT" "save first"
+  # --file names the environment, like for Vercel; --env= keeps the deployed Worker
+  expect_rc 0 export cloudflare --file .dev.vars.staging --dry-run
+  assert_contains "$OUT" "Worker api, environment staging"
+  assert_contains "$OUT" "environment staging: from the file name"
+  expect_rc 0 export cloudflare --file .dev.vars.staging --yes
+  assert_contains "$(tail -n 1 "$STUB/wrangler.log")" "secret bulk --config $p/wrangler.toml --env staging"
+  assert_eq "$(jq -c . "$STUB/wrangler.stdin")" '{"K":"staging"}'
+  expect_rc 0 export cloudflare --file .dev.vars.staging --env= --dry-run
+  assert_contains "$OUT" "(deployed, top-level)"
+  assert_contains "$OUT" "add --env <name> (the same file is sent)"
+  # options export cloudflare does not use are refused
+  expect_rc 1 export cloudflare --update-shared --dry-run
+  # a Worker never deployed: wrangler secret bulk creates it
+  touch "$STUB/wrangler.listfail"
+  expect_rc 0 export cloudflare --env production --yes
+  assert_contains "$OUT" "not deployed yet: wrangler creates it"
+  rm "$STUB/wrangler.listfail"
+  # more than 100 secrets: a failed later batch says what is already live
+  for i in $(seq 1 150); do keys="${keys}K$i=v$i"$'\n'; done
+  printf '%s' "$keys" >"$p/.dev.vars.big"
+  expect_rc 0 save -q -y
+  rm -f "$STUB/wrangler.bulkcount"
+  touch "$STUB/wrangler.bulkfail.2"
+  expect_rc 1 export cloudflare --env big --yes
+  assert_contains "$OUT" "2 batches"
+  assert_contains "$OUT" "100 of 150 secrets were already uploaded and deployed by the earlier batches"
+  assert_eq "$(jq 'length' "$STUB/wrangler.stdin.1")" "100"
+  # an option-like Pages project name is refused before wrangler runs
+  local s
+  s="$(mkproject pagesite)"
+  printf 'name = "--help"\npages_build_output_dir = "./dist"\n' >"$s/wrangler.toml"
+  printf 'P=1\n' >"$s/.env"
+  cd "$s"
+  expect_rc 0 save -q -y
+  expect_rc 1 export cloudflare --dry-run
+  assert_contains "$OUT" "invalid Pages project name"
+}
+
+t_export_cloudflare_newer_vault_is_not_save_first() {
+  local p p2
+  p="$(mkproject cfw)"
+  printf 'name = "cfw"\n' >"$p/wrangler.toml"
+  printf 'CF=1\n' >"$p/.dev.vars"
+  expect_rc 0 save -C "$p" -q -y
+  p2="$T/A/home/elsewhere/cfw"
+  mkdir -p "$p2"
+  git -C "$p2" init -q
+  git -C "$p2" remote add origin "git@github.com:me/cfw.git"
+  cp "$p/wrangler.toml" "$p2/"
+  expect_rc 0 restore -C "$p2" -q -y
+  printf 'CF=2\n' >"$p2/.dev.vars"
+  expect_rc 0 save -C "$p2" -q -y
+  cd "$p"
+  expect_rc 0 export cloudflare --dry-run
+  assert_contains "$OUT" "the vault has a newer .dev.vars than your local file"
+  assert_not_contains "$OUT" "Save first"
+}
+
+t_provider_settings_and_sizes() {
+  local p big
+  expect_rc 1 config set vercel-cmd 'npx -y "vercel@58.4.0"'
+  assert_contains "$OUT" "quotes and backslashes are not supported"
+  expect_rc 0 config set vercel-cmd '~/bin/vercel --debug'
+  assert_contains "$OUT" "not an executable command here"
+  expect_rc 0 config get vercel-cmd
+  assert_eq "$OUT" "$HOME/bin/vercel --debug"
+  expect_rc 0 config set vercel-cmd vercel
+  # REPO is only used by init: the setting says where the vault really syncs
+  expect_rc 0 config set repo me/other-vault
+  assert_contains "$OUT" "ENVORA_REPO is only used by ev init: this vault syncs with $T/remote.git"
+  # the stdin limit counts bytes: 40000 two-byte characters are skipped
+  p="$(mkproject web)"
+  mkdir -p "$p/.vercel"
+  printf '{}\n' >"$p/.vercel/project.json"
+  big="$(head -c 40000 /dev/zero | tr '\0' x | sed 's/x/é/g')"
+  printf 'BIGU=%s\nSMALL=1\n' "$big" >"$p/.env.preview"
+  printf '{"envs":[]}\n' >"$STUB/vercel.ls.preview.json"
+  cd "$p"
+  expect_rc 0 save -q -y
+  LANG=en_US.UTF-8 LC_ALL=en_US.UTF-8 expect_rc 0 export vercel --env preview --yes
+  assert_contains "$OUT" "BIGU  (value over 60 KB"
+  assert_not_contains "$(cat "$STUB/vercel.stdin")" "BIGU"
+  assert_contains "$(cat "$STUB/vercel.stdin")" "add preview SMALL=1"
 }
 
 # --- run ---------------------------------------------------------------------
