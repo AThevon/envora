@@ -134,8 +134,15 @@ now_stamp() {
 # --- dotenv ------------------------------------------------------------------
 #
 # dotenv_json TAG < file  ->  one JSON object per variable: {"s":TAG,"k":..,"v":..}
-# Supports: comments, export prefix, unquoted values with " #" comments,
-# '...' literal, "..." with \n \r \t \" \\ escapes, multi-line quoted values.
+# Same rules as the dotenv package that wrangler and Next.js use, so what envora
+# sends to a platform is what `wrangler dev` / `next dev` read locally:
+#   - optional "export ", KEY = value, comments start with # (even mid-value
+#     when the value is not quoted)
+#   - '...' and `...` are literal; "..." only turns \n and \r into newlines
+#   - a quoted value may span lines when its closing quote ends a line
+#   - an unclosed quote is a literal value on its own line (it never swallows
+#     the following lines)
+#   - a UTF-8 BOM and CRLF line endings are ignored
 
 DOTENV_AWK='
 function jesc(s,   out, i, c, n) {
@@ -153,58 +160,88 @@ function jesc(s,   out, i, c, n) {
   return out
 }
 function emit(k, v) { printf "{\"s\":\"%s\",\"k\":\"%s\",\"v\":\"%s\"}\n", tag, jesc(k), jesc(v) }
-function scanq(s, i,   c, c2, n) {
-  n = length(s)
-  while (i <= n) {
+function trim(s) { sub(/^[ \t]+/, "", s); sub(/[ \t]+$/, "", s); return s }
+function dq_escapes(s,   out, i, n, c, c2) {
+  out = ""; n = length(s)
+  for (i = 1; i <= n; i++) {
     c = substr(s, i, 1)
-    if (q == "\"" && c == "\\" && i < n) {
+    if (c == "\\" && i < n) {
       c2 = substr(s, i + 1, 1)
-      if (c2 == "n") val = val "\n"
-      else if (c2 == "r") val = val "\r"
-      else if (c2 == "t") val = val "\t"
-      else if (c2 == "\"") val = val "\""
-      else if (c2 == "\\") val = val "\\"
-      else val = val "\\" c2
-      i += 2
-      continue
+      if (c2 == "n") { out = out "\n"; i++; continue }
+      if (c2 == "r") { out = out "\r"; i++; continue }
     }
-    if (c == q) return 1
-    val = val c
-    i++
+    out = out c
+  }
+  return out
+}
+# Find the closing quote q of a value starting on line li at column col.
+# Sets CL (line) and CP (column) and returns 1, or returns 0.
+function closing(q, li, col,   l, s, n, j, c) {
+  for (l = li; l <= nl; l++) {
+    s = L[l]; n = length(s)
+    j = (l == li) ? col : 1
+    while (j <= n) {
+      c = substr(s, j, 1)
+      if (c == "\\" && j < n && substr(s, j + 1, 1) == q) { j += 2; continue }
+      if (c == q) { CL = l; CP = j; return 1 }
+      j++
+    }
   }
   return 0
 }
 BEGIN {
-  inq = 0
   for (i = 1; i < 32; i++) if (i != 9 && i != 10 && i != 13) ctl[sprintf("%c", i)] = i
 }
 {
-  sub(/\r$/, "")
-  if (inq) {
-    val = val "\n"
-    if (scanq($0, 1)) { emit(key, val); inq = 0 }
-    next
-  }
   line = $0
-  sub(/^[ \t]+/, "", line)
-  if (line == "" || substr(line, 1, 1) == "#") next
-  sub(/^export[ \t]+/, "", line)
-  if (!match(line, /^[A-Za-z_][A-Za-z0-9_.-]*[ \t]*=/)) next
-  key = substr(line, 1, RLENGTH)
-  sub(/[ \t]*=$/, "", key)
-  rest = substr(line, RLENGTH + 1)
-  sub(/^[ \t]+/, "", rest)
-  c = substr(rest, 1, 1)
-  if (c == "\"" || c == "\047" || c == "`") {
-    q = c; val = ""
-    if (scanq(rest, 2)) emit(key, val); else inq = 1
-    next
-  }
-  sub(/[ \t]+#.*$/, "", rest)
-  sub(/[ \t]+$/, "", rest)
-  emit(key, rest)
+  if (NR == 1 && substr(line, 1, 3) == "\357\273\277") line = substr(line, 4)
+  sub(/\r$/, "", line)
+  L[NR] = line
 }
-END { if (inq) emit(key, val) }
+END {
+  nl = NR
+  i = 1
+  while (i <= nl) {
+    line = L[i]
+    sub(/^[ \t]+/, "", line)
+    sub(/^export[ \t]+/, "", line)
+    if (!match(line, /^[A-Za-z0-9_.-]+[ \t]*=/)) { i++; continue }
+    key = substr(line, 1, RLENGTH)
+    sub(/[ \t]*=$/, "", key)
+    rest = substr(line, RLENGTH + 1)
+    sub(/^[ \t]+/, "", rest)
+    off = length(L[i]) - length(rest)
+    q = substr(rest, 1, 1)
+    if ((q == "\"" || q == "\047" || q == "`") && closing(q, i, off + 2)) {
+      after = substr(L[CL], CP + 1)
+      if (after ~ /^[ \t]*(#.*)?$/) {
+        if (CL == i) {
+          val = substr(L[i], off + 2, CP - off - 2)
+        } else {
+          val = substr(L[i], off + 2)
+          for (l = i + 1; l < CL; l++) val = val "\n" L[l]
+          val = val "\n" substr(L[CL], 1, CP - 1)
+        }
+        if (q == "\"") val = dq_escapes(val)
+        emit(key, val)
+        i = CL + 1
+        continue
+      }
+    }
+    # Unquoted (or a quote that does not close properly): up to #, trimmed.
+    val = rest
+    p = index(val, "#")
+    if (p > 0) val = substr(val, 1, p - 1)
+    val = trim(val)
+    c = substr(val, 1, 1)
+    if (length(val) >= 2 && (c == "\"" || c == "\047" || c == "`") && substr(val, length(val), 1) == c) {
+      val = substr(val, 2, length(val) - 2)
+    }
+    if (c == "\"") val = dq_escapes(val)
+    emit(key, val)
+    i++
+  }
+}
 '
 
 dotenv_json() {

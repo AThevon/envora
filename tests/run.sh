@@ -1005,18 +1005,25 @@ t_dotenv_parser() {
   # shellcheck source=lib/util.sh
   . "$ROOT/lib/util.sh"
   local got
-  got="$(printf '%s\n' \
+  # same results as the dotenv package used by wrangler and Next.js
+  got="$({ printf '\357\273\277'; printf '%s\n' \
+    'FIRST=bom' \
     '# comment' \
     'export A=1' \
     'B = two  # inline comment' \
+    'HASH=abc#def' \
     "C='single # not comment'" \
     'D="dq \"esc\" \n done"' \
+    'TAB="x\ty"' \
     'E="multi' \
     'line"' \
     'F=' \
     'not a var' \
-    'G.H-I=dots' | dotenv_json x | jq -c '{(.k): .v}' | jq -sc add)"
-  assert_eq "$got" '{"A":"1","B":"two","C":"single # not comment","D":"dq \"esc\" \n done","E":"multi\nline","F":"","G.H-I":"dots"}'
+    'G.H-I=dots' \
+    'BROKEN="unterminated' \
+    'TOKEN=after-broken' \
+    'LAST="ok" # c'; } | dotenv_json x | jq -c '{(.k): .v}' | jq -Sc -s add)"
+  assert_eq "$got" '{"A":"1","B":"two","BROKEN":"\"unterminated","C":"single # not comment","D":"dq \\\"esc\\\" \n done","E":"multi\nline","F":"","FIRST":"bom","G.H-I":"dots","HASH":"abc","LAST":"ok","TAB":"x\\ty","TOKEN":"after-broken"}'
 }
 
 t_menu_previews_and_items() {
