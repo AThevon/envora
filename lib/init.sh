@@ -1,18 +1,35 @@
 #!/usr/bin/env bash
 # lib/init.sh - first-time or new-machine setup
 
-# Extract AGE-SECRET-KEY lines from pasted text and install them as the key.
+# Install the AGE-SECRET-KEY-... found anywhere in pasted text (a single-line
+# prompt turns the newlines of a pasted key file into spaces). An existing,
+# different key is kept as <key>.bak-<date>: envora still reads old files with it.
 install_key_from_text() {
-  local text="$1" secret pub
-  secret="$(printf '%s\n' "$text" | tr -d '\r' | grep -E '^[[:space:]]*AGE-SECRET-KEY-' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' || true)"
+  local text="$1" secret pub old_pub bak n=1
+  secret="$(printf '%s\n' "$text" | tr -d '\r' | grep -oE 'AGE-SECRET-KEY-[A-Z0-9-]+' || true)"
   if [[ -z "$secret" ]]; then
-    err "no AGE-SECRET-KEY-... line found in what you pasted"
+    err "no AGE-SECRET-KEY-... found in what you pasted"
     return 1
   fi
   pub="$(printf '%s\n' "$secret" | age-keygen -y 2>/dev/null | head -n 1)" || pub=""
   [[ -n "$pub" ]] || { err "this is not a valid age key"; return 1; }
   mkdir -p "$(dirname "$ENVORA_KEY")" || return 1
   chmod 700 "$(dirname "$ENVORA_KEY")" 2>/dev/null || true
+  if key_exists; then
+    old_pub="$(pubkey_of "$ENVORA_KEY" || true)"
+    if [[ "$old_pub" == "$pub" ]]; then
+      KEY_PUB="$pub"
+      ok "this key is already in place ($(printf '%.20s' "$pub")...)"
+      return 0
+    fi
+    bak="$ENVORA_KEY.bak-$(now_stamp)"
+    while [[ -e "$bak" ]]; do n=$((n + 1)); bak="$ENVORA_KEY.bak-$(now_stamp)-$n"; done
+    if ! cp -p "$ENVORA_KEY" "$bak" || ! chmod 600 "$bak"; then
+      err "cannot keep the current key as $bak: nothing changed"
+      return 1
+    fi
+    say "${C_DIM}the previous key is kept at $(tildify "$bak")${C_RST}"
+  fi
   register_cleanup "$ENVORA_KEY.envora-tmp"
   {
     printf '# envora key, imported %s\n' "$(date +%Y-%m-%dT%H:%M:%S)"
@@ -21,14 +38,20 @@ install_key_from_text() {
   } >"$ENVORA_KEY.envora-tmp"
   chmod 600 "$ENVORA_KEY.envora-tmp"
   mv -f "$ENVORA_KEY.envora-tmp" "$ENVORA_KEY"
+  unregister_cleanup "$ENVORA_KEY.envora-tmp"
   KEY_PUB="$pub"
   ok "key saved to $(tildify "$ENVORA_KEY") ($(printf '%.20s' "$pub")...)"
 }
 
 init_import_key() {
-  local text=""
-  if is_interactive; then
-    say "Paste your envora key (the AGE-SECRET-KEY-... line, or the whole key file)."
+  local text="" try=1
+  if ! is_interactive; then
+    text="$(cat)"
+    install_key_from_text "$text"
+    return
+  fi
+  say "Paste your envora key: the AGE-SECRET-KEY-... line (pasting the whole key file works too)."
+  while [[ $try -le 3 ]]; do
     if has gum; then
       text="$(gum input --password --placeholder "AGE-SECRET-KEY-..." --width 80 </dev/tty)" || return 1
     else
@@ -36,10 +59,11 @@ init_import_key() {
       IFS= read -rs text </dev/tty || return 1
       printf '\n' >&2
     fi
-  else
-    text="$(cat)"
-  fi
-  install_key_from_text "$text"
+    install_key_from_text "$text" && return 0
+    try=$((try + 1))
+    [[ $try -le 3 ]] && say "try again (Esc to stop)"
+  done
+  return 1
 }
 
 init_generate_key() {
@@ -155,7 +179,10 @@ run_init() {
   done
 
   say "${C_BOLD}1. your key${C_RST}  ${C_DIM}$(tildify "$ENVORA_KEY")${C_RST}"
-  if key_exists; then
+  if key_exists && [[ "$key_mode" == import ]]; then
+    # Replace the key on purpose (rotated elsewhere, wrong key on this machine).
+    init_import_key || return 1
+  elif key_exists; then
     require_key || return 1
     ok "key found ($(printf '%.20s' "$KEY_PUB")...)"
   else
@@ -208,12 +235,23 @@ run_init() {
   fi
 
   # The vault must be encrypted for this key.
-  local rec
-  if rec="$(vault_recipient)" && [[ -n "$rec" && "$rec" != "$KEY_PUB" ]]; then
+  local rec c
+  while rec="$(vault_recipient)" && [[ -n "$rec" && "$rec" != "$KEY_PUB" ]]; do
     recipient_mismatch_message "$rec"
-    return 1
-  fi
+    is_interactive || return 1
+    c="$(choose "What now?" \
+      "Paste the right key now (the current one is kept as .bak)" \
+      "Stop here")" || return 1
+    case "$c" in
+      Paste*) init_import_key || return 1 ;;
+      *) return 1 ;;
+    esac
+  done
 
+  [[ -n "$ENVORA_REPO" ]] && config_mark ENVORA_REPO
+  [[ "$ENVORA_VAULT" != "$HOME/.env-vault" ]] && config_mark ENVORA_VAULT
+  [[ "$ENVORA_KEY" != "$HOME/.age/key.txt" ]] && config_mark ENVORA_KEY
+  [[ "$ENVORA_PROJECTS" != "$HOME/projects" ]] && config_mark ENVORA_PROJECTS
   save_config || warn "cannot write $(config_rc_path)"
   say ""
   ok "envora is ready: vault $(tildify "$ENVORA_VAULT")${ENVORA_REPO:+ ($ENVORA_REPO)}"

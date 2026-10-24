@@ -939,6 +939,24 @@ t_init_import_existing_key() {
   cd "$pc"
   expect_rc 0 restore
   assert_eq "$(cat "$pc/.env")" "A=1"
+  # the whole key file pasted on one line (what a single-line prompt does)
+  use_machine G
+  RC=0
+  OUT="$(tr '\n' ' ' <"$T/A/home/.age/key.txt" | "$TEST_BASH" "$EV" init --import-key --repo "$T/remote.git" 2>&1)" || RC=$?
+  [[ $RC == 0 ]] || fail "init with a pasted key file failed: $OUT"
+  assert_eq "$(age-keygen -y "$ENVORA_KEY")" "$(age-keygen -y "$T/A/home/.age/key.txt")"
+  # a machine with the wrong key replaces it, the old one is kept as .bak
+  use_machine H
+  mkdir -p "$HOME/.age"
+  age-keygen -o "$ENVORA_KEY" 2>/dev/null
+  expect_rc 1 init --repo "$T/remote.git"
+  assert_contains "$OUT" "ev init --import-key"
+  RC=0
+  OUT="$(printf '%s\n' "$key" | "$TEST_BASH" "$EV" init --import-key 2>&1)" || RC=$?
+  [[ $RC == 0 ]] || fail "replacing the key failed: $OUT"
+  assert_contains "$OUT" "previous key is kept"
+  ls "$ENVORA_KEY".bak-* >/dev/null 2>&1 || fail "the replaced key was not kept"
+  assert_eq "$(age-keygen -y "$ENVORA_KEY")" "$(age-keygen -y "$T/A/home/.age/key.txt")"
   # garbage key refused
   use_machine D
   RC=0
@@ -955,7 +973,7 @@ t_init_generate_and_create_with_gh() {
   assert_file "$ENVORA_KEY"
   assert_contains "$(cat "$STUB/gh.log")" "repo create my-vault --private"
   assert_contains "$(cat "$STUB/gh.log")" "repo view my-vault --json nameWithOwner -q .nameWithOwner"
-  assert_contains "$(cat "$HOME/.envorarc")" "ENVORA_REPO=me/my-vault"
+  assert_contains "$(cat "$HOME/.envorarc")" "ENVORA_REPO='me/my-vault'"
   local p
   p="$(mkproject app)"
   printf 'A=1\n' >"$p/.env"
@@ -1303,6 +1321,22 @@ EOF
   assert_eq "$OUT" "$HOME/dir with \$dollar and 'quote'"
   expect_rc 1 config set vault relative/path
   expect_rc 1 config set nope x
+  # non-ASCII survives the round trip; control characters are refused
+  unset ENVORA_VAULT ENVORA_KEY
+  LC_ALL=C expect_rc 0 config set vault "~/Coffre é"
+  expect_rc 0 config get vault
+  assert_eq "$OUT" "$HOME/Coffre é"
+  expect_rc 1 config set vault "$(printf '/a\tb')"
+  assert_contains "$OUT" "control characters"
+  # values from the environment or the defaults are never written to the file
+  ENVORA_KEY=/tmp/temporary-key expect_rc 0 config set repo me/other
+  assert_not_contains "$(cat "$HOME/.envorarc")" "temporary-key"
+  ENVORA_REPO=env/wins expect_rc 0 config set repo me/third
+  assert_contains "$OUT" "also set in your environment"
+  # an unreadable line is reported, not silently replaced by the default
+  printf "ENVORA_PROJECTS=\$'/x\\ty'\n" >>"$HOME/.envorarc"
+  expect_rc 0 config get projects
+  assert_contains "$OUT" "cannot read ENVORA_PROJECTS"
 }
 
 t_dotenv_parser() {

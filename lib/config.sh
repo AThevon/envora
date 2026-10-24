@@ -3,7 +3,9 @@
 # lib/config.sh - settings: defaults < ~/.envorarc < ENVORA_* environment
 #
 # The rc file is parsed as KEY=VALUE lines, never sourced. Only known keys are
-# read. Values are written back escaped with printf %q.
+# read. "ev config set" writes back only what the file already had plus the
+# setting being changed (never values that came from the environment or from
+# the defaults), each value single-quoted.
 
 CONFIG_KEYS="ENVORA_VAULT ENVORA_KEY ENVORA_PROJECTS ENVORA_REPO ENVORA_VERCEL_CMD ENVORA_WRANGLER_CMD"
 
@@ -25,26 +27,58 @@ expand_path() {
   printf '%s' "$v"
 }
 
-# Undo the quoting forms we accept: "..." '...' and backslash escapes (%q).
+# Read a value the way a shell would read a word: '...' literal, "..." with
+# \" \\ \$ \` escapes, backslash escapes outside quotes, pieces glued
+# together. Returns 1 for what it does not understand ($'...', open quote).
 config_unquote() {
-  local v="$1"
-  case "$v" in
-    \"*\") v="${v#\"}"; v="${v%\"}" ;;
-    \'*\') v="${v#\'}"; v="${v%\'}"; printf '%s' "$v"; return 0 ;;
-    \$\'*) return 1 ;;
-  esac
-  local res="" c i n=${#v}
-  i=0
+  local v="$1" res="" c nxt i=0 n state=none
+  case "$v" in \$\'*) return 1 ;; esac
+  n=${#v}
   while [[ $i -lt $n ]]; do
     c="${v:$i:1}"
-    if [[ "$c" == "\\" && $((i + 1)) -lt $n ]]; then
-      i=$((i + 1))
-      c="${v:$i:1}"
-    fi
-    res="$res$c"
+    case "$state" in
+      none)
+        if [[ "$c" == "'" ]]; then
+          state=single
+        elif [[ "$c" == '"' ]]; then
+          state=double
+        elif [[ "$c" == "\\" ]]; then
+          i=$((i + 1))
+          res="$res${v:$i:1}"
+        else
+          res="$res$c"
+        fi
+        ;;
+      single)
+        if [[ "$c" == "'" ]]; then state=none; else res="$res$c"; fi
+        ;;
+      double)
+        if [[ "$c" == '"' ]]; then
+          state=none
+        elif [[ "$c" == "\\" ]]; then
+          nxt="${v:$((i + 1)):1}"
+          case "$nxt" in
+            '"'|"\\"|'$'|'`') res="$res$nxt"; i=$((i + 1)) ;;
+            *) res="$res$c" ;;
+          esac
+        else
+          res="$res$c"
+        fi
+        ;;
+    esac
     i=$((i + 1))
   done
+  [[ "$state" == none ]] || return 1
   printf '%s' "$res"
+}
+
+# 'value' with ' written as '\''
+config_quote() {
+  printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"
+}
+
+config_rc_label() {
+  tildify "$(config_rc_path)"
 }
 
 config_is_known() {
@@ -60,6 +94,8 @@ load_config() {
   local k
   for k in $CONFIG_KEYS; do
     eval "_ENV_SET_$k=\${$k+x}"
+    eval "_RC_HAS_$k=''"
+    eval "_RC_$k=''"
   done
 
   local rc line key val
@@ -73,7 +109,13 @@ load_config() {
       key="${line%%=*}"
       val="${line#*=}"
       config_is_known "$key" || continue
-      val="$(config_unquote "$val")" || continue
+      if ! val="$(config_unquote "$val")"; then
+        warn "$(config_rc_label): cannot read $key (unsupported quoting): ignored. Set it again: ev config set $key <value>"
+        continue
+      fi
+      # What the file says, kept apart: "ev config set" writes only this back.
+      printf -v "_RC_$key" '%s' "$val"
+      eval "_RC_HAS_$key=1"
       if [[ -z "$(eval "printf '%s' \"\${_ENV_SET_$key}\"")" ]]; then
         printf -v "$key" '%s' "$val"
       fi
@@ -89,16 +131,27 @@ load_config() {
   ENVORA_STATE="$(expand_path "${XDG_STATE_HOME:-$HOME/.local/state}")/envora"
 }
 
+# Mark a setting to be written by the next save_config, with its current value.
+config_mark() {
+  local k="$1" v
+  config_is_known "$k" || return 1
+  eval "v=\${$k:-}"
+  printf -v "_RC_$k" '%s' "$v"
+  eval "_RC_HAS_$k=1"
+}
+
 save_config() {
-  local rc k v tmp
+  local rc k v has tmp
   rc="$(config_rc_path)"
   tmp="$(mktemp "$rc.envora-XXXXXX")" || return 1
   {
     printf '# envora settings (edit with: ev config)\n'
-    for k in ENVORA_VAULT ENVORA_KEY ENVORA_PROJECTS ENVORA_REPO ENVORA_VERCEL_CMD ENVORA_WRANGLER_CMD; do
-      eval "v=\${$k:-}"
+    for k in $CONFIG_KEYS; do
+      eval "has=\${_RC_HAS_$k:-}"
+      [[ -n "$has" ]] || continue
+      eval "v=\${_RC_$k:-}"
       [[ -z "$v" ]] && continue
-      printf '%s=%q\n' "$k" "$v"
+      printf '%s=%s\n' "$k" "$(config_quote "$v")"
     done
   } >"$tmp"
   chmod 600 "$tmp"
@@ -120,9 +173,10 @@ config_var_name() {
 
 config_validate() {
   local var="$1" val="$2"
-  case "$val" in
-    *$'\n'*) err "values cannot contain a newline"; return 1 ;;
-  esac
+  if [[ "$val" == *[[:cntrl:]]* ]]; then
+    err "values cannot contain a newline, a tab or other control characters"
+    return 1
+  fi
   case "$var" in
     ENVORA_VAULT|ENVORA_KEY|ENVORA_PROJECTS)
       [[ -n "$val" ]] || { err "$var cannot be empty"; return 1; }
@@ -151,8 +205,12 @@ config_set() {
   esac
   config_validate "$var" "$val" || return 1
   printf -v "$var" '%s' "$val"
+  config_mark "$var"
   save_config || { err "cannot write $(config_rc_path)"; return 1; }
-  ok "$var = $val"
+  ok "$var = $val  ${C_DIM}(saved in $(tildify "$(config_rc_path)"))${C_RST}"
+  if [[ -n "$(eval "printf '%s' \"\${_ENV_SET_$var:-}\"")" ]]; then
+    warn "$var is also set in your environment: that value wins while it is set"
+  fi
 }
 
 config_describe() {
