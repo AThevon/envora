@@ -116,7 +116,11 @@ warn_if_local_differs() {
 
 # Show the last lines of a tool's output, indented.
 show_tool_output() {
-  sed 's/^/    /' "$1" | grep -v '^ *$' | tail -n "${2:-6}" >&2 || true
+  if [[ "${QUIET:-0}" == 1 ]]; then
+    grep -v '^ *$' "$1" | tail -n 1 | sed 's/^/ev: /' >&2 || true
+  else
+    sed 's/^/    /' "$1" | grep -v '^ *$' | tail -n "${2:-6}" >&2 || true
+  fi
 }
 
 cmd_import() {

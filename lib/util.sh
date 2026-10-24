@@ -118,6 +118,7 @@ resolve_symlink() {
 }
 
 # /Users/me/x -> ~/x (display only)
+# shellcheck disable=SC2088  # a literal ~ is the point here
 tildify() {
   case "$1" in
     "$HOME") printf '~' ;;

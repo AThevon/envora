@@ -189,6 +189,8 @@ EOF
     commit_rc=0
     vault_commit "$msg" "$PROJECT_NAME" .recipient .gitattributes || commit_rc=$?
     [[ $commit_rc == 2 ]] && return 1
+  else
+    vault_commit "envora: record the vault public key" .recipient >/dev/null || true
   fi
 
   local push_rc=0

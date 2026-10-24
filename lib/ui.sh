@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# shellcheck disable=SC2034  # colors are used by the other modules
 # lib/ui.sh - output, colors and prompts
 #
 # Conventions:

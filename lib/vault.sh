@@ -290,7 +290,9 @@ vault_push() {
     fi
   done
   err "PUSH FAILED: the vault was saved on this machine but NOT sent to GitHub"
-  sed 's/^/  git: /' "$TMP_ROOT/push.err" | grep -v '^  git: *$' | head -n 5 >&2 || true
+  if [[ "${QUIET:-0}" != 1 ]]; then
+    sed 's/^/  git: /' "$TMP_ROOT/push.err" | grep -v '^  git: *$' | head -n 5 >&2 || true
+  fi
   say "  run 'ev sync' when you are back online"
   return 3
 }
