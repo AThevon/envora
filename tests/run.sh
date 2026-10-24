@@ -1856,6 +1856,37 @@ t_killed_runs_leave_no_plaintext() {
   assert_eq "$(grep -rl 'A=1' "$TMPDIR" 2>/dev/null | grep -v '\.age$' || true)" ""
 }
 
+t_forget_while_another_machine_saves() {
+  local key="$T/A/home/.age/key.txt" p pb x
+  p="$(mkproject app)"
+  printf 'A=1\n' >"$p/.env"
+  (cd "$p" && expect_rc 0 save -q -y)
+  new_machine B "$key"
+  pb="$(mkproject app)"
+  (cd "$pb" && expect_rc 0 restore -q -y)
+  printf 'A=2\n' >"$pb/.env"
+  (cd "$pb" && expect_rc 3 save -q -y --no-sync)
+  x="$(git -C "$ENVORA_VAULT" rev-parse HEAD)"
+  git -C "$ENVORA_VAULT" push -q origin HEAD:refs/heads/side
+  cat >"$T/remote.git/hooks/pre-receive" <<HOOK
+#!/bin/sh
+if [ ! -f "$T/raced" ]; then
+  touch "$T/raced"
+  unset GIT_QUARANTINE_PATH
+  git update-ref refs/heads/main $x
+  exit 1
+fi
+exit 0
+HOOK
+  chmod +x "$T/remote.git/hooks/pre-receive"
+  use_machine A
+  expect_rc 1 forget app --yes
+  assert_contains "$OUT" "another machine saved app while it was being removed"
+  assert_not_contains "$OUT" "removed app"
+  assert_file "$ENVORA_VAULT/app/.env.age"
+  assert_eq "$(cat "$ENVORA_VAULT/app/.origin")" "git@github.com:me/app.git"
+}
+
 # --- run ---------------------------------------------------------------------
 
 echo "envora tests · $("$TEST_BASH" -c 'echo "bash $BASH_VERSION"') · $(age --version)"

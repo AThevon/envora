@@ -814,6 +814,8 @@ cmd_forget() {
     vault_pull || return 1
     [[ -e "$ENVORA_VAULT/$target" ]] || { ok "already gone from the vault"; return 0; }
   fi
+  local saved_origin=""
+  [[ -z "$file" ]] && saved_origin="$(entry_origin "$name")"
   vgit rm -r -q -- "$target" >/dev/null 2>"$TMP_ROOT/git.err" || {
     err "cannot remove $target: $(head -n 1 "$TMP_ROOT/git.err")"
     return 1
@@ -828,6 +830,19 @@ cmd_forget() {
   }
   local push_rc=0
   vault_push || push_rc=$?
+  # The push retry may have merged a save made meanwhile by another machine:
+  # that newer version is kept (never deleted behind its back).
+  if [[ -e "$ENVORA_VAULT/$target" ]]; then
+    if [[ -n "$saved_origin" && ! -f "$ENVORA_VAULT/$name/.origin" ]]; then
+      printf '%s\n' "$saved_origin" >"$ENVORA_VAULT/$name/.origin"
+      vault_commit "forget: keep the origin of $name (saved again by another machine)" "$name" >/dev/null || true
+      push_rc=0
+      vault_push || push_rc=$?
+    fi
+    warn "another machine saved ${file:+$file of }$name while it was being removed: its new version is kept in the vault"
+    say "  run 'ev forget $name${file:+ $file}' again to remove it anyway"
+    return 1
+  fi
   result "$push_rc" "removed $what from the vault$(push_suffix "$push_rc")"
   return "$push_rc"
 }
