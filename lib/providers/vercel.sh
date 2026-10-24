@@ -8,10 +8,17 @@
 #   vercel env ls E --format json                {"envs":[{"key","value","type","target":[..],"gitBranch"}]}
 #   vercel target list --format json             {"targets":[{"slug",...}]}
 #   vercel env add NAME E --yes / vercel env update NAME E --yes   value on stdin
+#     - stdin is read once: an empty value counts as "no value" (it prompts),
+#       and only the first chunk (about 64 KB) is read
+#     - update changes the whole variable: every environment it targets
+#   .vercel/project.json (vercel link) or .vercel/repo.json at the repo root
+#     (vercel link --repo: {"projects":[{"name","directory"}]})
 
 VERCEL_STD_ENVS="development preview production"
+VERCEL_STDIN_MAX=60000
 
-# Dirs (absolute) linked to a Vercel project: they hold .vercel/project.json
+# Dirs (absolute) linked to a Vercel project: they hold .vercel/project.json,
+# or are listed by the repo link .vercel/repo.json of the project root.
 vercel_dirs() {
   local d prune_expr=()
   for d in $PRUNE_DIRS; do
@@ -20,12 +27,24 @@ vercel_dirs() {
     prune_expr[${#prune_expr[@]}]="-name"
     prune_expr[${#prune_expr[@]}]="$d"
   done
-  find "$PROJECT_DIR" -maxdepth "$SCAN_DEPTH" \
-    \( -type d -name .vercel -print -prune \) -o \
-    \( -type d \( "${prune_expr[@]}" \) -prune \) 2>/dev/null |
-    while IFS= read -r d; do
-      [[ -f "$d/project.json" ]] && dirname "$d"
-    done | LC_ALL=C sort -u
+  {
+    find "$PROJECT_DIR" -maxdepth "$SCAN_DEPTH" \
+      \( -type d -name .vercel -print -prune \) -o \
+      \( -type d \( "${prune_expr[@]}" \) -prune \) 2>/dev/null |
+      while IFS= read -r d; do
+        [[ -f "$d/project.json" ]] && dirname "$d"
+      done
+    if [[ -f "$PROJECT_DIR/.vercel/repo.json" ]]; then
+      jq -r '.projects[]?.directory // empty' "$PROJECT_DIR/.vercel/repo.json" 2>/dev/null |
+        while IFS= read -r d; do
+          case "$d" in
+            .|"") printf '%s\n' "$PROJECT_DIR" ;;
+            /*|*..*) ;;
+            *) [[ -d "$PROJECT_DIR/${d#./}" ]] && printf '%s\n' "$PROJECT_DIR/${d#./}" ;;
+          esac
+        done
+    fi
+  } | LC_ALL=C sort -u
 }
 
 # Vault path (relative to the project entry) of a snapshot.
@@ -35,15 +54,15 @@ vercel_snapshot_rel() {
 }
 
 vercel_not_linked() {
-  err "this project is not linked to Vercel (no .vercel/project.json)"
-  if is_interactive && confirm "Run 'vercel link' in $PROJECT_DIR now?"; then
+  err "this project is not linked to Vercel (no .vercel/project.json or .vercel/repo.json)"
+  if is_interactive && confirm "Run 'vercel link' in $(tildify "$PROJECT_DIR") now?"; then
     provider_cmd vercel || return 1
     (cd "$PROJECT_DIR" && "${PCMD[@]}" link) || { err "vercel link failed"; return 1; }
-    [[ -f "$PROJECT_DIR/.vercel/project.json" ]] && return 0
+    [[ -n "$(vercel_dirs)" ]] && return 0
     err "still not linked"
     return 1
   fi
-  say "  link it first: cd $PROJECT_DIR && vercel link"
+  say "  link it first: cd $(tildify "$PROJECT_DIR") && vercel link"
   return 1
 }
 
@@ -72,11 +91,9 @@ vercel_import() {
   [[ -z "$P_FILE" ]] || { err "--file is not used by import"; return 1; }
   vault_ready || return 1
   require_key || return 1
-  vault_pull || return 1
-  check_recipient write || return 1
   resolve_project "" || return 1
-  check_origin "$PROJECT_NAME" || return 1
 
+  # Linking may ask questions: done before taking the vault.
   local dirs pdir reldir
   dirs="$(vercel_dirs)"
   if [[ -z "$dirs" ]]; then
@@ -86,6 +103,10 @@ vercel_import() {
   pdir="$(pick_dir Vercel "$dirs")" || return 1
   reldir="$(rel_of_dir "$pdir")"
   provider_cmd vercel || return 1
+
+  vault_pull || return 1
+  check_recipient write || return 1
+  check_origin "$PROJECT_NAME" "import vercel" || return 1
 
   local envs="$P_ENV"
   if [[ -z "$envs" ]]; then
@@ -98,7 +119,7 @@ vercel_import() {
     done
   fi
 
-  local base="$ENVORA_VAULT/$PROJECT_NAME" env tmp merged snap rel n unknown total_unknown=0
+  local base="$ENVORA_VAULT/$PROJECT_NAME" env tmp merged snap rel n unknown sens total_unknown=0 total_carried=0
   local changed=() failed=0 same=0
   for env in $envs; do
     tmp="$TMP_ROOT/vercel.$env.env"
@@ -117,10 +138,12 @@ vercel_import() {
     else
       awk "$VERCEL_MERGE_AWK" /dev/null "$tmp" >"$merged"
     fi
+    sens="$(grep -v '^VERCEL_OIDC_TOKEN=' "$tmp" | grep -c '^[A-Za-z_][A-Za-z0-9_.-]*="\[SENSITIVE\]"$' || true)"
     rm -f "$tmp"
     n="$(dotenv_keys <"$merged" | grep -c . || true)"
     unknown="$(grep -c '^[A-Za-z_][A-Za-z0-9_.-]*="\[SENSITIVE\]"$' "$merged" || true)"
     total_unknown=$((total_unknown + unknown))
+    total_carried=$((total_carried + sens - unknown))
     if [[ -f "$snap" ]] && same_plaintext "$snap" "$merged"; then
       same=$((same + 1))
       step "$env  ${C_DIM}$(plural "$n" variable), unchanged${C_RST}"
@@ -140,11 +163,20 @@ vercel_import() {
   local push_rc=0
   vault_push || push_rc=$?
 
+  if [[ $total_carried -gt 0 ]]; then
+    warn "$(plural "$total_carried" value) carried over from the previous snapshot: Secret on Vercel, so it may have changed there since"
+  fi
   if [[ $total_unknown -gt 0 ]]; then
-    warn "$(plural "$total_unknown" secret) are write-only on Vercel, value unknown (kept as [SENSITIVE]; put the real values in your project files and ev save)"
+    if [[ $total_unknown -eq 1 ]]; then
+      warn "1 secret is write-only on Vercel, value unknown (kept as [SENSITIVE])"
+    else
+      warn "$total_unknown secrets are write-only on Vercel, values unknown (kept as [SENSITIVE])"
+    fi
+    say "  snapshots are never restored into the project: read them with ev status --values;"
+    say "  keep the real values in your project files (ev save), the vault is the source of truth"
   fi
   if [[ ${#changed[@]} -gt 0 ]]; then
-    ok "Vercel → vault: $(plural ${#changed[@]} environment) updated ($(join_by ', ' "${changed[@]}"))$(push_suffix "$push_rc")"
+    result "$push_rc" "Vercel → vault: $(plural ${#changed[@]} environment) updated ($(join_by ', ' "${changed[@]}"))$(push_suffix "$push_rc")"
   elif [[ $failed -eq 0 ]]; then
     ok "Vercel → vault: nothing changed since the last snapshot"
   fi
@@ -165,13 +197,34 @@ vercel_env_of_file() {
   esac
 }
 
+# Per key on Vercel for environment E: "key<TAB>other targets<TAB>branch"
+#   other targets: the environments the general variable ALSO targets (an
+#     update changes them too); branch: "branch" when the key also has
+#     branch-specific values for E.
+VERCEL_KEYS_JQ='
+  [ .envs[]?
+    | { key,
+        branch: ((.gitBranch // "") != ""),
+        t: ((.target // []) | if type == "array" then . else [.] end) }
+    | select(($std | index($e) | not) or (.t | index($e) != null)) ]
+  | group_by(.key)[]
+  | . as $g
+  | ([$g[] | select(.branch | not)] | .[0]) as $main
+  | [ $g[0].key,
+      (if $main then ($main.t - [$e] | join(", ")) else "" end),
+      (if ([$g[] | select(.branch)] | length) > 0 then "branch" else "" end),
+      (if $main then "general" else "" end) ]
+  | @tsv'
+
 vercel_export() {
   parse_provider_args "export vercel" "$@" || return 1
   vault_ready || return 1
   require_key || return 1
   vault_pull || return 1
   check_recipient read || return 1
+  vault_unlock # read-only from here: prompts must not hold the vault
   resolve_project "" || return 1
+  check_origin "$PROJECT_NAME" "export vercel" || return 1
 
   local dirs pdir reldir
   dirs="$(vercel_dirs)"
@@ -194,7 +247,7 @@ vercel_export() {
       [[ -f "$base/$f.age" ]] && cands[${#cands[@]}]="$f"
     done
     if [[ ${#cands[@]} -eq 0 ]]; then
-      err "no .env.production / .env.preview / .env.development saved for this project"
+      err "no .env.production / .env.preview / .env.development saved for $(dir_label "$reldir")"
       say "  pick a file and an environment: ev export vercel --file <file> --env <env>"
       return 1
     fi
@@ -229,18 +282,19 @@ vercel_export() {
     show_tool_output "$TMP_ROOT/vls.err"
     return 1
   fi
+  local info
+  info="$(jq -r --arg e "$env" --argjson std '["production","preview","development"]' "$VERCEL_KEYS_JQ" "$TMP_ROOT/vls.json" 2>/dev/null)" || {
+    err "unexpected output from vercel env ls"
+    return 1
+  }
   local remote_filter='
     .envs[]? | select((.gitBranch // "") == "")
     | select(
         ($std | index($e) | not)
         or ((.target // []) | (if type == "array" then . else [.] end) | index($e) != null)
       )'
-  local remote plain_same
-  remote="$(jq -r --arg e "$env" --argjson std '["production","preview","development"]' "$remote_filter | .key" "$TMP_ROOT/vls.json" 2>/dev/null | LC_ALL=C sort -u)" || {
-    err "unexpected output from vercel env ls"
-    return 1
-  }
   # Plain (readable) variables whose value is already the same can be skipped.
+  local plain_same
   plain_same="$({
     jq -c --arg e "$env" --argjson std '["production","preview","development"]' "$remote_filter | select(.type == \"plain\" and .value != null) | {s: \"r\", k: .key, v: .value}" "$TMP_ROOT/vls.json" 2>/dev/null
     printf '%s\n' "$recs"
@@ -248,39 +302,81 @@ vercel_export() {
              | (map(select(.s=="v")) | map({(.k): .v}) | add // {}) as $V
              | $V | keys[] as $k | select(($R | has($k)) and $R[$k] == $V[$k]) | $k' 2>/dev/null || true)"
 
-  local k add=() upd=() same=() only=()
+  local k line others branch general val len
+  local add=() upd=() same=() only=() shared=() shared_info=() branchy=() empty=() big=()
   while IFS= read -r k; do
     [[ -z "$k" ]] && continue
+    line="$(printf '%s\n' "$info" | awk -F '\t' -v k="$k" '$1 == k' | head -n 1)"
+    others="$(printf '%s' "$line" | cut -f2)"
+    branch="$(printf '%s' "$line" | cut -f3)"
+    general="$(printf '%s' "$line" | cut -f4)"
+    val="$(printf '%s\n' "$recs" | jq -sj --arg k "$k" 'map(select(.k == $k)) | last | .v')"
+    len=${#val}
     if printf '%s\n' "$plain_same" | grep -Fxq -- "$k"; then
       same[${#same[@]}]="$k"
-    elif printf '%s\n' "$remote" | grep -Fxq -- "$k"; then
-      upd[${#upd[@]}]="$k"
+    elif [[ $len -eq 0 ]]; then
+      empty[${#empty[@]}]="$k"
+    elif [[ $len -gt $VERCEL_STDIN_MAX ]]; then
+      big[${#big[@]}]="$k"
+    elif [[ "$general" == general ]]; then
+      if [[ "$branch" == branch ]]; then
+        branchy[${#branchy[@]}]="$k"
+      elif [[ -n "$others" ]]; then
+        shared[${#shared[@]}]="$k"
+        shared_info[${#shared_info[@]}]="$k (also $others)"
+      else
+        upd[${#upd[@]}]="$k"
+      fi
     else
       add[${#add[@]}]="$k"
     fi
-  done <<EOF
-$keys
-EOF
+  done <<<"$keys"
   while IFS= read -r k; do
     [[ -z "$k" ]] && continue
+    [[ "$(printf '%s' "$k" | cut -f4)" == general ]] || continue
+    k="$(printf '%s' "$k" | cut -f1)"
     printf '%s\n' "$keys" | grep -Fxq -- "$k" || only[${#only[@]}]="$k"
-  done <<EOF
-$remote
-EOF
+  done <<<"$info"
 
-  say "${C_BOLD}vault → Vercel${C_RST}  ${C_DIM}vault/$PROJECT_NAME/$file → Vercel $env ($(rel_of_dir "$pdir"))${C_RST}"
-  [[ ${#add[@]} -gt 0 ]] && say "  ${C_ACC}+ add${C_RST}     $(join_by ' ' "${add[@]}")"
-  [[ ${#upd[@]} -gt 0 ]] && say "  ${C_WARN}~ update${C_RST}  $(join_by ' ' "${upd[@]}")"
-  [[ ${#same[@]} -gt 0 ]] && say "  ${C_DIM}= same     $(join_by ' ' "${same[@]}")${C_RST}"
-  [[ ${#only[@]} -gt 0 ]] && say "  ${C_DIM}· only on Vercel, kept: $(join_by ' ' "${only[@]}")${C_RST}"
+  plan_line "${C_BOLD}vault → Vercel${C_RST}  ${C_DIM}vault/$PROJECT_NAME/$file → Vercel $env ($(dir_label "$reldir"))${C_RST}"
+  [[ ${#add[@]} -gt 0 ]] && plan_line "  ${C_ACC}+ add${C_RST}     $(join_by ' ' "${add[@]}")"
+  [[ ${#upd[@]} -gt 0 ]] && plan_line "  ${C_WARN}~ update${C_RST}  $(join_by ' ' "${upd[@]}")"
+  [[ ${#same[@]} -gt 0 ]] && plan_line "  ${C_DIM}= same     $(join_by ' ' "${same[@]}")${C_RST}"
+  if [[ ${#shared[@]} -gt 0 ]]; then
+    plan_line "  ${C_WARN}! shared${C_RST}  $(join_by ', ' "${shared_info[@]}")"
+    plan_line "            ${C_DIM}one variable on Vercel serves several environments: updating it changes them all${C_RST}"
+  fi
+  [[ ${#branchy[@]} -gt 0 ]] && plan_line "  ${C_WARN}! skipped${C_RST} $(join_by ' ' "${branchy[@]}")  ${C_DIM}(also has branch-specific values: change it in the Vercel dashboard)${C_RST}"
+  [[ ${#empty[@]} -gt 0 ]] && plan_line "  ${C_DIM}· skipped  $(join_by ' ' "${empty[@]}")  (empty value: the Vercel CLI cannot receive it, set it by hand)${C_RST}"
+  [[ ${#big[@]} -gt 0 ]] && plan_line "  ${C_DIM}· skipped  $(join_by ' ' "${big[@]}")  (value over 60 KB: the Vercel CLI would cut it, set it by hand)${C_RST}"
+  [[ ${#only[@]} -gt 0 ]] && plan_line "  ${C_DIM}· only on Vercel, kept: $(join_by ' ' "${only[@]}")${C_RST}"
+
+  # Shared variables are only updated on an explicit yes.
+  local send_shared=0
+  if [[ ${#shared[@]} -gt 0 ]]; then
+    if [[ $P_SHARED == 1 ]]; then
+      send_shared=1
+    elif [[ $P_DRY != 1 ]] && is_interactive; then
+      if confirm "Also update the shared variables ($(join_by ', ' "${shared[@]}"))? Their other environments change too." no; then
+        send_shared=1
+      fi
+    else
+      plan_line "            ${C_DIM}skipped: add --update-shared to update them anyway${C_RST}"
+    fi
+  fi
+  [[ $send_shared == 1 ]] && upd=(${upd[@]+"${upd[@]}"} "${shared[@]}")
 
   local todo=$(( ${#add[@]} + ${#upd[@]} ))
   if [[ $todo -eq 0 ]]; then
-    ok "Vercel ($env) already has these values"
+    if [[ ${#shared[@]} -eq 0 && ${#branchy[@]} -eq 0 && ${#empty[@]} -eq 0 && ${#big[@]} -eq 0 ]]; then
+      ok "Vercel ($env) already has these values"
+    else
+      plan_line "nothing to send automatically"
+    fi
     return 0
   fi
   if [[ $P_DRY == 1 ]]; then
-    say "${C_DIM}dry run: nothing sent${C_RST}"
+    plan_line "${C_DIM}dry run: nothing sent${C_RST}"
     return 0
   fi
   if ! confirm "Send $(plural "$todo" variable) to Vercel ($env)?"; then
@@ -289,14 +385,14 @@ EOF
     return 1
   fi
 
-  local failed=0 done_n=0 action
+  local failed=0 done_n=0 action label
   for k in ${add[@]+"${add[@]}"} ${upd[@]+"${upd[@]}"}; do
-    action=add
-    printf '%s\n' "${upd[@]+"${upd[@]}"}" | grep -Fxq -- "$k" && action=update
+    action=add label=added
+    if printf '%s\n' "${upd[@]+"${upd[@]}"}" | grep -Fxq -- "$k"; then action=update label=updated; fi
     if printf '%s\n' "$recs" | jq -sj --arg k "$k" 'map(select(.k == $k)) | last | .v' |
       (cd "$pdir" && "${PCMD[@]}" env "$action" "$k" "$env" --yes) >"$TMP_ROOT/vadd.out" 2>&1; then
       done_n=$((done_n + 1))
-      step "$k  ${C_DIM}${action}d${C_RST}"
+      step "$k  ${C_DIM}$label${C_RST}"
     else
       err "vercel env $action $k failed:"
       show_tool_output "$TMP_ROOT/vadd.out" 3

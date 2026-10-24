@@ -1030,7 +1030,8 @@ EOF
   printf '# Created by Vercel CLI\nST="1"\n' >"$STUB/vercel.staging.env"
   cd "$p"
   expect_rc 0 import vercel
-  assert_contains "$OUT" "1 secret are write-only on Vercel, value unknown"
+  assert_contains "$OUT" "1 secret is write-only on Vercel, value unknown"
+  assert_contains "$OUT" "ev status --values"
   local snap="$ENVORA_VAULT/web/@vercel/production.env.age"
   assert_file "$snap"
   assert_file "$ENVORA_VAULT/web/@vercel/staging.env.age"
@@ -1048,6 +1049,14 @@ EOF
   plain="$(age -d -i "$ENVORA_KEY" "$snap")"
   assert_contains "$plain" 'API_KEY="real-secret"'
   assert_not_contains "$OUT" "write-only"
+  assert_contains "$OUT" "1 value carried over from the previous snapshot"
+  # snapshots can be read back
+  expect_rc 0 status
+  assert_contains "$OUT" "@vercel/production.env"
+  assert_contains "$OUT" "only in Vercel"
+  expect_rc 0 status --values
+  assert_contains "$OUT" 'PUBLIC_URL="https://example.com"'
+
   assert_not_contains "$(cat "$STUB/vercel.log")" "--value"
   # vercel errors are shown, not hidden
   touch "$STUB/vercel.fail"
@@ -1125,8 +1134,59 @@ t_export_cloudflare_pages() {
   assert_contains "$OUT" "only has the production and preview"
   expect_rc 0 export cloudflare --yes
   assert_contains "$OUT" "only on Cloudflare, kept: OLD_SECRET"
-  assert_contains "$(tail -n 1 "$STUB/wrangler.log")" "pages secret bulk --project-name site"
+  assert_contains "$(tail -n 1 "$STUB/wrangler.log")" "pages secret bulk (cwd=$p)"
   assert_eq "$(jq -c . "$STUB/wrangler.stdin")" '{"S":"1"}'
+  # the name wrangler will use: comments, nested names and trailing commas ignored
+  printf '{\n  "$schema": "https://x/schema.json", // "name": "old-site",\n  /* "name": "older" */\n  "name": "real-site",\n  "vars": {"name": "nope",},\n  "pages_build_output_dir": "./dist",\n}\n' >"$p/wrangler.jsonc"
+  expect_rc 0 export cloudflare --dry-run
+  assert_contains "$OUT" "Pages project real-site"
+  # a Worker whose config only mentions pages_build_output_dir in a comment
+  rm "$p/wrangler.jsonc"
+  printf '# migrated from Pages: removed pages_build_output_dir\nname = "edge-worker" # the worker\n' >"$p/wrangler.toml"
+  expect_rc 0 export cloudflare --dry-run -q
+  assert_contains "$OUT" "Worker edge-worker"
+  assert_contains "$OUT" "dry run: nothing sent"
+}
+
+t_export_cloudflare_safety() {
+  local p other
+  p="$(mkproject cfw)"
+  printf 'name = "cfw"\n' >"$p/wrangler.toml"
+  printf 'API_TOKEN=tok\n' >"$p/.dev.vars"
+  cd "$p"
+  expect_rc 0 save
+  # another repo with the same name never receives these secrets
+  other="$T/A/home/work/cfw"
+  mkdir -p "$other"
+  git -C "$other" init -q
+  git -C "$other" remote add origin git@github.com:acme/cfw.git
+  printf 'name = "acme-worker"\n' >"$other/wrangler.toml"
+  cd "$other"
+  expect_rc 1 export cloudflare --yes
+  assert_contains "$OUT" "belongs to another repository"
+  assert_no_file "$STUB/wrangler.stdin"
+  # --env never falls back to the local development file
+  cd "$p"
+  expect_rc 1 export cloudflare --env production --yes
+  assert_contains "$OUT" "no .dev.vars.production or .env.production saved"
+  assert_contains "$OUT" "--file .dev.vars"
+  assert_no_file "$STUB/wrangler.stdin"
+  expect_rc 0 export cloudflare --env production --file .dev.vars --yes
+  assert_eq "$(jq -c . "$STUB/wrangler.stdin")" '{"API_TOKEN":"tok"}'
+  # monorepo: the config of the current folder is picked
+  local m
+  m="$(mkproject mono)"
+  mkdir -p "$m/apps/edge/src" "$m/apps/api"
+  printf 'name = "edge"\n' >"$m/apps/edge/wrangler.toml"
+  printf 'name = "api"\n' >"$m/apps/api/wrangler.toml"
+  printf 'E=1\n' >"$m/apps/edge/.dev.vars"
+  cd "$m"
+  expect_rc 0 save
+  expect_rc 1 export cloudflare --dry-run
+  assert_contains "$OUT" "several Cloudflare configs"
+  cd "$m/apps/edge/src"
+  expect_rc 0 export cloudflare --dry-run
+  assert_contains "$OUT" "Worker edge"
 }
 
 t_export_vercel_stub() {
@@ -1153,6 +1213,8 @@ EOF
   assert_contains "$OUT" "only on Vercel, kept: ONLY_REMOTE"
   assert_no_file "$STUB/vercel.stdin"
   expect_rc 0 export vercel --yes
+  assert_contains "$OUT" "FRESH  added"
+  assert_contains "$OUT" "EXISTING  updated"
   assert_contains "$(cat "$STUB/vercel.stdin")" "add production FRESH=with space"
   assert_contains "$(cat "$STUB/vercel.stdin")" "update production EXISTING=new-value"
   assert_not_contains "$(cat "$STUB/vercel.stdin")" "SAME"
@@ -1163,6 +1225,46 @@ EOF
   expect_rc 0 save
   expect_rc 1 export vercel --file .env.custom --yes
   assert_contains "$OUT" "which Vercel environment"
+}
+
+t_export_vercel_shared_branch_empty() {
+  local p
+  p="$(mkproject web)"
+  mkdir -p "$p/.vercel"
+  printf '{}\n' >"$p/.vercel/project.json"
+  printf 'DATABASE_URL=postgres://localhost/dev\nPREV_BRANCHY=x\nEMPTY=\nOWN=1\n' >"$p/.env.development"
+  cat >"$STUB/vercel.ls.development.json" <<'EOF'
+{"envs":[
+ {"key":"DATABASE_URL","type":"encrypted","target":["production","preview","development"]},
+ {"key":"PREV_BRANCHY","type":"encrypted","target":["development"]},
+ {"key":"PREV_BRANCHY","type":"encrypted","target":["development"],"gitBranch":"feat"},
+ {"key":"OWN","type":"encrypted","target":["development"]}
+]}
+EOF
+  cd "$p"
+  expect_rc 0 save
+  expect_rc 0 export vercel --env development --yes
+  assert_contains "$OUT" "! shared  DATABASE_URL (also production, preview)"
+  assert_contains "$OUT" "--update-shared"
+  assert_contains "$OUT" "PREV_BRANCHY  (also has branch-specific values"
+  assert_contains "$OUT" "EMPTY  (empty value"
+  assert_contains "$(cat "$STUB/vercel.stdin")" "update development OWN=1"
+  assert_not_contains "$(cat "$STUB/vercel.stdin")" "DATABASE_URL"
+  assert_not_contains "$(cat "$STUB/vercel.stdin")" "EMPTY"
+  assert_not_contains "$(cat "$STUB/vercel.stdin")" "PREV_BRANCHY"
+  expect_rc 0 export vercel --env development --update-shared --yes
+  assert_contains "$(cat "$STUB/vercel.stdin")" "update development DATABASE_URL=postgres://localhost/dev"
+  # repo link (vercel link --repo) counts as linked
+  local m
+  m="$(mkproject mono)"
+  mkdir -p "$m/.vercel" "$m/apps/site"
+  printf '{"remoteName":"origin","projects":[{"id":"p1","name":"site","directory":"apps/site"}]}\n' >"$m/.vercel/repo.json"
+  printf 'S=1\n' >"$m/apps/site/.env.production"
+  printf '{"envs":[]}\n' >"$STUB/vercel.ls.production.json"
+  cd "$m"
+  expect_rc 0 save
+  expect_rc 0 export vercel --dry-run
+  assert_contains "$OUT" "Vercel production (apps/site)"
 }
 
 t_deprecated_aliases() {

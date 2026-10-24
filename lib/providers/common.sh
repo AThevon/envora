@@ -61,15 +61,28 @@ rel_of_dir() {
   if [[ "$1" == "$PROJECT_DIR" ]]; then printf '.'; else printf '%s' "${1#"$PROJECT_DIR"/}"; fi
 }
 
+# Human label of a project-relative dir: "." is the project root.
+dir_label() {
+  if [[ "$1" == "." ]]; then printf 'project root'; else printf '%s' "$1"; fi
+}
+
+# A line of a provider plan: command output (stdout). Shown even with --quiet
+# when it is all the user asked for (--dry-run).
+plan_line() {
+  if [[ "${QUIET:-0}" == 1 && "${P_DRY:-0}" != 1 ]]; then return 0; fi
+  out "$*"
+}
+
 # Prefix a file name with a project-relative dir ("." -> none).
 in_dir() {
   if [[ "$1" == "." ]]; then printf '%s' "$2"; else printf '%s/%s' "$1" "$2"; fi
 }
 
 # pick_dir "label" "dirs (one per line)" -> chosen absolute dir
-# Uses -C <dir> when it is one of them, else the only one, else asks.
+# Uses -C <dir> when it is one of them, else the deepest one holding the
+# current directory, else the only one, else asks.
 pick_dir() {
-  local label="$1" list="$2" cand c_abs="" count
+  local label="$1" list="$2" cand c_abs="" count here best=""
   [[ -n "$list" ]] || return 1
   count="$(printf '%s\n' "$list" | grep -c .)"
   if [[ -n "${ARG_C:-}" ]]; then
@@ -79,9 +92,18 @@ pick_dir() {
         printf '%s' "$cand"
         return 0
       fi
-    done <<EOF
-$list
-EOF
+    done <<<"$list"
+  else
+    here="$(pwd -P 2>/dev/null || true)"
+    while IFS= read -r cand; do
+      case "$here/" in
+        "$cand"/*) [[ ${#cand} -gt ${#best} ]] && best="$cand" ;;
+      esac
+    done <<<"$list"
+    if [[ -n "$best" && ( "$best" != "$PROJECT_DIR" || "$count" -eq 1 ) ]]; then
+      printf '%s' "$best"
+      return 0
+    fi
   fi
   if [[ "$count" -eq 1 ]]; then
     printf '%s' "$list"
@@ -108,6 +130,7 @@ warn_if_local_differs() {
   same_plaintext "$vf" "$PROJECT_DIR/$rel" && return 0
   warn "your local $rel differs from the vault copy ($(key_diff_line "$rel")). Save first? (ev save)"
   if is_interactive; then
+    vault_release
     confirm "Continue with the vault version?" || return 1
   fi
   return 0
@@ -147,11 +170,12 @@ cmd_export() {
 }
 
 # Shared option parsing for provider commands: --env --file --dry-run
-P_ENV="" P_FILE="" P_DRY=0
+# (--update-shared: export vercel only)
+P_ENV="" P_FILE="" P_DRY=0 P_SHARED=0
 parse_provider_args() {
   local cmd="$1"
   shift
-  P_ENV="" P_FILE="" P_DRY=0
+  P_ENV="" P_FILE="" P_DRY=0 P_SHARED=0
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --env|-e) [[ $# -ge 2 ]] || { err "--env needs a value"; return 1; }; P_ENV="$2"; shift ;;
@@ -159,6 +183,7 @@ parse_provider_args() {
       --file|-f) [[ $# -ge 2 ]] || { err "--file needs a value"; return 1; }; P_FILE="$2"; shift ;;
       --file=*) P_FILE="${1#--file=}" ;;
       --dry-run|-n) P_DRY=1 ;;
+      --update-shared) P_SHARED=1 ;;
       *) err "unknown option for $cmd: $1 (see: ev help $cmd)"; return 1 ;;
     esac
     shift
