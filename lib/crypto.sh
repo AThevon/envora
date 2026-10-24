@@ -41,12 +41,14 @@ vault_recipient() {
 
 recipient_mismatch_message() {
   local expected="$1"
-  err "this vault is encrypted for a different key"
+  err "this vault is encrypted for a different key than yours"
   say "  vault expects: $(printf '%.24s' "$expected")..."
-  say "  your key:      $(printf '%.24s' "$KEY_PUB")... ($ENVORA_KEY)"
-  say "  This usually means this machine has a new key instead of your envora key."
-  say "  Fix: put your existing key at $ENVORA_KEY (ev init > 'I already have an envora key'),"
-  say "  or point ENVORA_KEY to it. Nothing was changed."
+  say "  your key:      $(printf '%.24s' "$KEY_PUB")... ($(tildify "$ENVORA_KEY"))"
+  say "  Two usual causes:"
+  say "    - the key was rotated on another machine (ev rotate): import the new key"
+  say "    - this machine generated its own key instead of importing your envora key"
+  say "  Fix: ev init --import-key   (paste the right key; the current one is kept as .bak)"
+  say "  Nothing was changed."
 }
 
 # Check the vault recipient matches the local key.
@@ -76,6 +78,31 @@ check_recipient() {
 # decrypt_to_stdout file.age
 decrypt_stream() {
   age -d -i "$ENVORA_KEY" "$1"
+}
+
+# Every key this machine has: the current one, then the old ones kept by
+# "ev rotate" (<key>.bak-<date>). Sets ID_ARGS to "-i file" pairs.
+ID_ARGS=()
+load_identities() {
+  local f
+  ID_ARGS=(-i "$ENVORA_KEY")
+  for f in "$ENVORA_KEY".bak-*; do
+    [[ -f "$f" && -r "$f" ]] || continue
+    pubkey_of "$f" >/dev/null || continue
+    ID_ARGS[${#ID_ARGS[@]}]="-i"
+    ID_ARGS[${#ID_ARGS[@]}]="$f"
+  done
+}
+
+# Decrypt with the current key or any old one.
+decrypt_any() {
+  [[ ${#ID_ARGS[@]} -gt 0 ]] || load_identities
+  age -d "${ID_ARGS[@]}" "$1"
+}
+
+# True when the current key decrypts FILE.
+decrypts_with_key() {
+  age -d -i "$ENVORA_KEY" "$1" >/dev/null 2>&1
 }
 
 # encrypt_file src dest.age (atomic: temp file next to dest, then mv)

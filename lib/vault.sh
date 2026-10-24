@@ -68,7 +68,47 @@ vault_gitattributes() {
   fi
 }
 
-# Leave no half-finished git operation behind; commit stray changes.
+# Paths envora writes in the vault. Nothing else is ever committed by envora.
+is_managed_path() {
+  case "$1" in
+    .recipient|.gitattributes|*.age) return 0 ;;
+    */*/.origin) return 1 ;;
+    */.origin) return 0 ;;
+  esac
+  return 1
+}
+
+# Changed paths (modified, deleted, untracked) under the given pathspecs.
+vault_changed_paths() {
+  vgit status --porcelain -z --untracked-files=all --no-renames -- "$@" 2>/dev/null |
+    tr '\0' '\n' | cut -c 4-
+}
+
+# Stage the envora-managed changes under PATHS (default: the whole vault).
+# Managed files are encrypted, so they are staged even if a .gitignore matches
+# them; anything else (a stray plaintext file, a README) is never staged: it is
+# listed in $TMP_ROOT/unmanaged instead.
+vault_stage_managed() {
+  local p staged=()
+  [[ $# -gt 0 ]] || set -- .
+  : >"$TMP_ROOT/unmanaged"
+  while IFS= read -r p; do
+    [[ -z "$p" ]] && continue
+    if is_managed_path "$p"; then
+      staged[${#staged[@]}]="$p"
+    else
+      printf '%s\n' "$p" >>"$TMP_ROOT/unmanaged"
+    fi
+  done < <(vault_changed_paths "$@")
+  while IFS= read -r p; do
+    [[ -n "$p" ]] && is_managed_path "$p" && staged[${#staged[@]}]="$p"
+  done < <(vgit ls-files -z -o -i --exclude-standard -- "$@" 2>/dev/null | tr '\0' '\n')
+  [[ ${#staged[@]} -gt 0 ]] || return 0
+  vgit add -A -f -- "${staged[@]}" 2>"$TMP_ROOT/git.err"
+}
+
+# Leave no half-finished git operation behind; commit stray envora changes
+# (an interrupted save), but only encrypted files this machine can decrypt.
 vault_repair() {
   local gd
   gd="$(vgit rev-parse --absolute-git-dir 2>/dev/null)" || return 1
@@ -81,18 +121,39 @@ vault_repair() {
     vgit merge --abort >/dev/null 2>&1 || true
   fi
   find "$ENVORA_VAULT" -name '*.envora-*' -type f ! -path '*/.git/*' -exec rm -f {} + 2>/dev/null || true
-  if [[ -n "$(vgit status --porcelain 2>/dev/null)" ]]; then
-    vault_identity
-    vgit add -A -f -- . >/dev/null 2>&1 &&
-      vgit commit -q -m "envora: record changes left uncommitted" >/dev/null 2>&1 || true
+  [[ -n "$(vgit status --porcelain --untracked-files=all 2>/dev/null)" ]] || return 0
+  vault_identity
+  local p
+  vault_stage_managed || {
+    err "cannot record the uncommitted changes of the vault: $(head -n 1 "$TMP_ROOT/git.err")"
+    return 1
+  }
+  if [[ -s "$TMP_ROOT/unmanaged" ]]; then
+    local u=()
+    while IFS= read -r p; do u[${#u[@]}]="$p"; done <"$TMP_ROOT/unmanaged"
+    say "${C_DIM}the vault holds files envora does not manage (left uncommitted): $(short_list 3 "${u[@]}")${C_RST}"
   fi
+  vgit diff --cached --quiet 2>/dev/null && return 0
+  local unreadable=()
+  while IFS= read -r p; do
+    case "$p" in *.age) ;; *) continue ;; esac
+    decrypts_with_key "$ENVORA_VAULT/$p" || unreadable[${#unreadable[@]}]="$p"
+  done < <(vgit diff --cached --name-only --diff-filter=AM 2>/dev/null)
+  if [[ ${#unreadable[@]} -gt 0 ]]; then
+    vgit reset -q -- . >/dev/null 2>&1 || true
+    err "the vault has $(plural ${#unreadable[@]} file) left uncommitted that your key cannot decrypt: $(short_list 3 "${unreadable[@]}")"
+    say "  envora will not commit them. Run 'ev doctor'. To go back to the committed versions:"
+    say "  git -C $(tildify "$ENVORA_VAULT") checkout -- $(short_list 3 "${unreadable[@]}")"
+    return 1
+  fi
+  vgit commit -q -m "envora: record changes left uncommitted" >/dev/null 2>&1 || true
 }
 
 # One ev at a time touches the vault's git state (hooks may run in parallel).
 VAULT_LOCK=""
 vault_lock() {
   [[ -n "$VAULT_LOCK" ]] && return 0
-  local gd lock pid n=0
+  local gd lock pid n=0 who
   gd="$(vgit rev-parse --absolute-git-dir 2>/dev/null)" || return 1
   lock="$gd/envora.lock"
   while ! mkdir "$lock" 2>/dev/null; do
@@ -103,12 +164,14 @@ vault_lock() {
     fi
     n=$((n + 1))
     if [[ $n -ge 300 ]]; then
-      err "the vault is busy: another ev is running (lock: $lock)"
+      who="$(head -n 1 "$lock/cmd" 2>/dev/null || true)"
+      err "the vault is busy: '${who:-another ev}' (pid ${pid:-?}) is still running; retry when it is done"
       return 1
     fi
     sleep 0.1
   done
   printf '%s\n' "$$" >"$lock/pid"
+  printf '%s\n' "${ENVORA_CMDLINE:-ev}" >"$lock/cmd"
   VAULT_LOCK="$lock"
   register_cleanup "$lock"
 }
@@ -118,6 +181,22 @@ vault_unlock() {
   rm -rf "$VAULT_LOCK"
   unregister_cleanup "$VAULT_LOCK"
   VAULT_LOCK=""
+}
+
+# A prompt never holds the vault: a clone / wipe hook in another terminal must
+# not wait for an answer. Call vault_release before asking, vault_reacquire after.
+VAULT_RELEASED=0
+vault_release() {
+  VAULT_RELEASED=0
+  [[ -n "$VAULT_LOCK" ]] || return 0
+  VAULT_RELEASED=1
+  vault_unlock
+}
+
+vault_reacquire() {
+  [[ "$VAULT_RELEASED" == 1 ]] || return 0
+  VAULT_RELEASED=0
+  vault_lock
 }
 
 # Fail fast instead of hanging when the network is down (hooks run unattended).
@@ -145,7 +224,7 @@ vault_pull() {
   fi
   if ! vgit fetch -q origin 2>"$TMP_ROOT/fetch.err"; then
     SYNC_STATE=offline
-    warn "cannot reach the vault remote ($(head -n 1 "$TMP_ROOT/fetch.err")): using the local vault as is"
+    warn "cannot reach GitHub ($(head -n 1 "$TMP_ROOT/fetch.err")): using the local vault as is"
     return 0
   fi
   SYNC_STATE=synced
@@ -172,7 +251,7 @@ vault_pull() {
       err "cannot update the vault: $(head -n 1 "$TMP_ROOT/git.err")"
       return 1
     }
-  elif ! vgit rebase -q "$up" >"$TMP_ROOT/git.err" 2>&1; then
+  elif ! vgit rebase -q --autostash "$up" >"$TMP_ROOT/git.err" 2>&1; then
     vgit rebase --abort >/dev/null 2>&1 || true
     vault_merge_resolve "$up" || return 1
   fi
@@ -249,10 +328,16 @@ vault_resolve_age() {
     warn "conflict on $p: deleted on another machine, changed here: kept the changed version"
     return 0
   fi
-  local f_ours="$TMP_ROOT/conflict.ours" f_theirs="$TMP_ROOT/conflict.theirs" same=0 cmp_ok=1
-  vgit show ":2:$p" 2>/dev/null | age -d -i "$ENVORA_KEY" >"$f_ours" 2>/dev/null || cmp_ok=0
-  vgit show ":3:$p" 2>/dev/null | age -d -i "$ENVORA_KEY" >"$f_theirs" 2>/dev/null || cmp_ok=0
-  if [[ $cmp_ok == 1 ]] && cmp -s "$f_ours" "$f_theirs"; then
+  local f_ours="$TMP_ROOT/conflict.ours" f_theirs="$TMP_ROOT/conflict.theirs" same=0
+  [[ ${#ID_ARGS[@]} -gt 0 ]] || load_identities
+  if ! vgit show ":2:$p" 2>/dev/null | age -d "${ID_ARGS[@]}" >"$f_ours" 2>/dev/null ||
+    ! vgit show ":3:$p" 2>/dev/null | age -d "${ID_ARGS[@]}" >"$f_theirs" 2>/dev/null; then
+    rm -f "$f_ours" "$f_theirs"
+    err "conflict on $p: one of the two versions is encrypted for a key this machine does not have, so they cannot be compared"
+    say "  the vault is unchanged. Import the right key (ev init --import-key), then run ev sync"
+    return 1
+  fi
+  if cmp -s "$f_ours" "$f_theirs"; then
     same=1
   fi
   if [[ $same == 1 ]]; then
@@ -271,11 +356,7 @@ vault_resolve_age() {
   vgit checkout -q "--$keep" -- "$p" && vgit add -f -- "$p" || return 1
   local other_commit details=""
   other_commit="$(vgit log -1 --format=%h "$other_ref" -- "$p" 2>/dev/null)"
-  if [[ $cmp_ok == 1 ]]; then
-    details="$({ dotenv_json a <"$f_ours"; dotenv_json b <"$f_theirs"; } | dotenv_diff_stream | key_diff_summary "this machine" "the other machine")"
-  else
-    details="could not decrypt both versions to compare them"
-  fi
+  details="$({ dotenv_json a <"$f_ours"; dotenv_json b <"$f_theirs"; } | dotenv_diff_stream | key_diff_summary "this machine" "the other machine")"
   rm -f "$f_ours" "$f_theirs"
   warn "conflict on $p: kept the $kept_label version (most recent save); $details. The version from $other_label stays in git history (commit $other_commit)."
   return 0
@@ -286,7 +367,7 @@ vault_commit() {
   local message="$1"
   shift
   vault_identity
-  vgit add -A -f -- "$@" 2>"$TMP_ROOT/git.err" || {
+  vault_stage_managed "$@" || {
     err "git add failed in the vault: $(head -n 1 "$TMP_ROOT/git.err")"
     return 2
   }
@@ -342,18 +423,26 @@ vault_push() {
 
 # One line describing vault <-> GitHub.
 vault_sync_label() {
-  local ab ahead behind
+  local ab ahead behind state=""
   if ! vault_has_remote; then
-    printf 'no GitHub remote'
-    return 0
-  fi
-  if [[ "$SYNC_STATE" == offline ]]; then
-    printf 'offline'
+    printf 'no GitHub remote: nothing leaves this machine'
     return 0
   fi
   ab="$(vault_ahead_behind)"
   ahead="${ab% *}"
   behind="${ab#* }"
+  case "$SYNC_STATE" in
+    offline) state="offline" ;;
+    skipped) state="not checked with GitHub (--no-sync)" ;;
+  esac
+  if [[ -n "$state" ]]; then
+    if [[ "${ahead:-0}" -gt 0 ]]; then
+      printf '%s · ↑ %s to push (not on GitHub yet)' "$state" "$ahead"
+    else
+      printf '%s' "$state"
+    fi
+    return 0
+  fi
   if [[ "$ahead" -eq 0 && "$behind" -eq 0 ]]; then
     printf '✓ synced with GitHub'
   elif [[ "$behind" -eq 0 ]]; then
