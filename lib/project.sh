@@ -224,6 +224,13 @@ resolve_project() {
       set_project_dir "$(local_dir_of "$name")" || return 1
       guard_project_dir || return 1
       say "${C_DIM}'$name' lives in $(tildify "$PROJECT_DIR") on this machine${C_RST}"
+    elif [[ ! -d "$ENVORA_VAULT/$name" ]]; then
+      err "'$name' is not in the vault, and there is no folder $(tildify "$ENVORA_PROJECTS/$name")"
+      local names
+      names="$(vault_projects | tr '\n' ' ')"
+      [[ -n "$names" ]] && say "  projects in the vault: ${names% }"
+      say "  inside a project folder, run it without a name (or pass the folder with -C <dir>)"
+      return 1
     else
       err "no local folder for '$name': it is not the current project and $(tildify "$ENVORA_PROJECTS/$name") does not exist"
       say "  clone it first, or pass the folder with -C <dir>"

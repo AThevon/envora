@@ -136,10 +136,20 @@ cmd_doctor() {
       [[ -z "$rel" ]] && continue
       doc_warn "$rel is tracked by git: envora skips it (it is in your git history)" "git rm --cached '$rel' && echo '$rel' >> .gitignore, then ev save"
     done <"$TMP_ROOT/scan.tracked"
+    # Env files a save would miss: the wipe hook refuses the folder for them.
+    scan_unreached "$PROJECT_DIR"
+    while IFS= read -r rel; do
+      [[ -z "$rel" ]] && continue
+      doc_bad "$rel is NOT reached by envora ($(unreached_reason "$rel")): ev save leaves it out and exits 1" "move it up, or list it in .envoraignore if it holds no secret of yours"
+    done <"$TMP_ROOT/scan.unreached"
+    while IFS= read -r rel; do
+      [[ -z "$rel" ]] && continue
+      doc_bad "$rel cannot be saved: a newline or tab in its path" "rename it"
+    done <"$TMP_ROOT/scan.badnames"
     [[ $n -gt 0 ]] && doc_ok "$(plural "$n" "env file") handled by envora"
     [[ $n -eq 0 ]] && doc_info "no env files in this project"
     if vault_exists && [[ $key_ok == 1 && -d "$ENVORA_VAULT/$PROJECT_NAME" ]]; then
-      check_origin "$PROJECT_NAME" >/dev/null 2>&1 || doc_bad "the vault entry '$PROJECT_NAME' belongs to another repository" "ev save --as <other-name> (or --force if it is the same repo, renamed or moved)"
+      check_origin "$PROJECT_NAME" >/dev/null 2>&1 || doc_bad "the vault entry '$PROJECT_NAME' belongs to another repository" "ev save --as <other-name> (or ev save --as $PROJECT_NAME --force if it is the same repo, renamed or moved)"
       local legacy
       for legacy in .env.development .env.preview .env.production; do
         [[ -f "$ENVORA_VAULT/$PROJECT_NAME/$legacy.age" ]] || continue

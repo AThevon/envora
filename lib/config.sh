@@ -281,9 +281,10 @@ config_describe() {
 
 config_print() {
   local k v
-  out "${C_BOLD}settings${C_RST} ${C_DIM}$(config_rc_path)${C_RST}"
+  out "${C_BOLD}settings${C_RST} ${C_DIM}$(config_rc_label)${C_RST}"
   for k in $CONFIG_KEYS; do
     eval "v=\${$k:-}"
+    [[ -n "$v" ]] && v="$(tildify "$v")"
     out "  $(printf '%-20s' "$k") ${v:-${C_DIM}(not set)${C_RST}}"
     out "  $(printf '%-20s' '') ${C_DIM}$(config_describe "$k")${C_RST}"
   done
@@ -317,14 +318,15 @@ cmd_config() {
 }
 
 config_menu() {
-  local choice var cur new
+  local choice var cur new shown
   while true; do
     choice="$(
       for var in ENVORA_VAULT ENVORA_KEY ENVORA_PROJECTS ENVORA_REPO ENVORA_VERCEL_CMD ENVORA_WRANGLER_CMD; do
-        eval "cur=\${$var:-}"
-        printf '%s\t%-18s %s\n' "$var" "${var#ENVORA_}" "${cur:-(not set)}"
+        eval "shown=\${$var:-}"
+        [[ -n "$shown" ]] && shown="$(tildify "$shown")"
+        printf '%s\t%-18s %s\n' "$var" "${var#ENVORA_}" "${shown:-(not set)}"
       done | fzf --ansi --height=~40% --layout=reverse --border=rounded \
-        --border-label=" settings " --delimiter=$'\t' --with-nth=2 \
+        --border-label=" settings " --delimiter=$'\t' --with-nth=2 --pointer='›' \
         --no-input --header="enter edit · esc back" \
         --color="$FZF_COLORS" \
         --preview='"$ENVORA_BASH" "$ENVORA_SELF" _preview config {1}' \
@@ -345,8 +347,12 @@ config_preview() {
   out ""
   out "$(config_describe "$var")"
   out ""
+  [[ -n "$v" ]] && v="$(tildify "$v")"
   out "current: ${v:-(not set)}"
+  if [[ "$var" == ENVORA_REPO ]] && vault_exists; then
+    out "the vault syncs with: $(sanitize_origin "$(vgit remote get-url origin 2>/dev/null || printf 'no remote')")"
+  fi
   out ""
-  out "${C_DIM}stored in $(config_rc_path)${C_RST}"
+  out "${C_DIM}stored in $(config_rc_label)${C_RST}"
   out "${C_DIM}an ENVORA_* environment variable overrides the file${C_RST}"
 }

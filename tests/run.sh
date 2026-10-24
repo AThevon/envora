@@ -431,7 +431,7 @@ t_name_validation() {
   assert_no_file "$T/A/home/escape.age"
   cd "$T"
   expect_rc 1 restore nope
-  assert_contains "$OUT" "no local folder for 'nope'"
+  assert_contains "$OUT" "'nope' is not in the vault"
 }
 
 t_restore_by_name_never_substring() {
@@ -1856,20 +1856,30 @@ t_sync_interrupt_never_leaves_a_merge() {
   # a slow decryption keeps the conflict resolution running
   real="$(command -v age)"
   mkdir -p "$T/slow"
-  printf '#!/bin/sh\nfor a in "$@"; do [ "$a" = -d ] && [ -f "%s/slow/on" ] && sleep 2; done\nexec "%s" "$@"\n' "$T" "$real" >"$T/slow/age"
+  printf '#!/bin/sh\nfor a in "$@"; do [ "$a" = -d ] && [ -f "%s/slow/on" ] && touch "%s/slow/started" && sleep 2; done\nexec "%s" "$@"\n' "$T" "$T" "$real" >"$T/slow/age"
   chmod +x "$T/slow/age"
   touch "$T/slow/on"
   # job control: the job gets its own process group and keeps SIGINT (a
   # non-interactive shell starts background jobs with SIGINT ignored)
   set -m
-  PATH="$T/slow:$PATH" "$TEST_BASH" "$EV" sync </dev/null >/dev/null 2>&1 &
+  PATH="$T/slow:$PATH" "$TEST_BASH" "$EV" sync </dev/null >"$T/sync.out" 2>&1 &
   pid=$!
-  sleep 1
-  kill -INT -- "-$pid"
+  local n=0 sig=INT want=130
+  # A suite started in the background inherits SIGINT ignored (and an ignored
+  # signal cannot be trapped): TERM takes the same cleanup path.
+  local probe prc=0
+  sleep 1 &
+  probe=$!
+  kill -INT -- "-$probe" 2>/dev/null
+  wait "$probe" || prc=$?
+  [[ $prc == 130 ]] || { sig=TERM; want=143; }
+  while [[ ! -f "$T/slow/started" && $n -lt 200 ]]; do sleep 0.1; n=$((n + 1)); done
+  sleep 0.3
+  kill -"$sig" -- "-$pid"
   wait "$pid" || rc=$?
   set +m
   rm -f "$T/slow/on"
-  assert_eq "$rc" "130"
+  assert_eq "$rc" "$want" "sync was not interrupted: $(cat "$T/sync.out")"
   gd="$(git -C "$ENVORA_VAULT" rev-parse --absolute-git-dir)"
   assert_no_file "$gd/MERGE_HEAD"
   assert_no_file "$gd/rebase-merge"
@@ -2450,6 +2460,103 @@ t_provider_settings_and_sizes() {
   assert_contains "$OUT" "BIGU  (value over 60 KB"
   assert_not_contains "$(cat "$STUB/vercel.stdin")" "BIGU"
   assert_contains "$(cat "$STUB/vercel.stdin")" "add preview SMALL=1"
+}
+
+t_unreached_files_show_everywhere() {
+  local p
+  p="$(mkproject deep)"
+  mkdir -p "$p/a/b/c/d/e" "$p/dist"
+  printf 'R=1\n' >"$p/.env"
+  printf 'D=1\n' >"$p/a/b/c/d/e/.env"
+  printf 'X=1\n' >"$p/dist/.env"
+  expect_rc 1 save -C "$p" --yes
+  assert_contains "$OUT" "! 1 file saved to the vault (deep) · pushed to GitHub · 2 env files NOT in the vault, see below"
+  assert_not_contains "$OUT" "✓ 1 file saved"
+  assert_contains "$OUT" "NOT saved: dist/.env (inside build/ or dist/"
+  assert_contains "$OUT" "Move them up"
+  expect_rc 0 status -C "$p"
+  assert_contains "$OUT" "a/b/c/d/e/.env  NOT reached by envora (deeper than 4 levels)"
+  OUT="$(ENVORA_MENU_DIR="$p" "$TEST_BASH" "$EV" _preview save 2>&1)"
+  assert_contains "$OUT" "dist/.env  NOT reached (inside build/ or dist/)"
+  assert_contains "$OUT" "2 env files of this folder would NOT be in the vault"
+  assert_not_contains "$OUT" "nothing to save: the vault is up to date"
+  cd "$p"
+  run_ev doctor --no-sync
+  assert_eq "$RC" "1"
+  assert_contains "$OUT" "a/b/c/d/e/.env is NOT reached by envora"
+  # once handled (.envoraignore), the folder is fine again
+  printf 'dist/\na/\n' >"$p/.envoraignore"
+  expect_rc 0 save -C "$p" --yes
+  assert_contains "$OUT" "nothing changed: the vault already has this file"
+}
+
+t_commands_refuse_flags_they_do_not_use() {
+  local p fork
+  p="$(mkproject app)"
+  printf 'A=1\n' >"$p/.env"
+  cd "$p"
+  expect_rc 0 save -q -y
+  expect_rc 1 status --force
+  assert_contains "$OUT" "unknown option for status: --force"
+  expect_rc 1 save --values
+  assert_contains "$OUT" "unknown option for save: --values"
+  expect_rc 1 restore --values
+  # a name that is not in the vault says so
+  expect_rc 1 restore apq
+  assert_contains "$OUT" "'apq' is not in the vault"
+  assert_contains "$OUT" "projects in the vault: app"
+  # --force alone never picks another repository's entry
+  fork="$T/A/home/elsewhere/app"
+  mkdir -p "$fork"
+  git -C "$fork" init -q
+  git -C "$fork" remote add origin "https://github.com/stranger/app.git"
+  expect_rc 1 restore -C "$fork" --force --yes
+  assert_contains "$OUT" "belongs to another repository"
+  assert_contains "$OUT" "--force alone does not choose the entry: name it with --as app"
+  assert_no_file "$fork/.env"
+  # sync offline: 1 when nothing waits, 3 when commits wait
+  mv "$T/remote.git" "$T/remote.gone"
+  expect_rc 1 sync
+  assert_contains "$OUT" "nothing from this machine waits to be pushed"
+  printf 'A=2\n' >"$p/.env"
+  expect_rc 3 save -q -y
+  expect_rc 3 sync
+  mv "$T/remote.gone" "$T/remote.git"
+}
+
+t_rotate_commits_are_not_saves() {
+  local key="$T/A/home/.age/key.txt" p pb save_commit
+  p="$(mkproject app)"
+  printf 'CF=1\n' >"$p/.dev.vars"
+  (cd "$p" && expect_rc 0 save -q -y)
+  new_machine B "$key"
+  pb="$(mkproject app)"
+  (cd "$pb" && expect_rc 0 restore -q -y)
+  printf 'CF=2\n' >"$pb/.dev.vars"
+  (cd "$pb" && expect_rc 0 save -q -y)
+  save_commit="$(git -C "$ENVORA_VAULT" log -1 --format=%h)"
+  use_machine A
+  cd "$p"
+  expect_rc 0 rotate --yes -q
+  expect_rc 0 status
+  assert_contains "$OUT" "newer in the vault (commit $save_commit,"
+}
+
+t_help_and_settings_are_consistent() {
+  expect_rc 0 help
+  assert_contains "$OUT" "ev save     [name] [--as name]"
+  assert_contains "$OUT" "ev forget   <name> [file]"
+  expect_rc 0 help save
+  assert_contains "$OUT" "ev save [name] [--as name]"
+  expect_rc 0 help forget
+  assert_contains "$OUT" "ev forget <name> [file]"
+  expect_rc 0 help config
+  assert_contains "$OUT" "~/.env-vault"
+  assert_contains "$OUT" "not set: wrangler, else npx wrangler@"
+  expect_rc 0 config
+  assert_contains "$OUT" "~/.env-vault"
+  OUT="$("$TEST_BASH" "$EV" _preview config ENVORA_REPO 2>&1)"
+  assert_contains "$OUT" "the vault syncs with: $T/remote.git"
 }
 
 # --- run ---------------------------------------------------------------------

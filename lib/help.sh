@@ -22,7 +22,7 @@ ${b}envora${r} ${d}v$VERSION · encrypted vault for your untracked .env files${r
 $(help_diagram)
 
 ${b}PROJECT ↔ VAULT${r}
-  ${a}ev save${r}     [-C dir] [--as name]      project → vault      encrypt this project's env files, commit, push
+  ${a}ev save${r}     [name] [--as name]        project → vault      encrypt this project's env files, commit, push
   ${a}ev restore${r}  [name] [--force]          vault → project      write the saved files back (asks before overwriting)
   ${a}ev status${r}   [name] [--values]         project ↔ vault      what differs, key names only (--values: real diff)
 
@@ -49,7 +49,7 @@ ${b}MAINTENANCE${r}
 ${b}GLOBAL FLAGS${r} ${d}(anywhere on the line)${r}
   -y, --yes      no prompts, safe defaults (backups before overwriting)
   -q, --quiet    only errors and warnings, one line each, on stderr
-  -C <dir>       act on the project in <dir>
+  -C <dir>       act on the project in <dir> (every project command accepts it)
   --no-sync      do not talk to GitHub (local vault only)
   -h, --help     help · -v, --version
 
@@ -67,7 +67,7 @@ show_help() {
     ""|help) help_overview ;;
     save|push|push-local)
       cat <<EOF
-${b}ev save${r} [name] [-C dir] [--as name]        ${a}project → vault${r}
+${b}ev save${r} [name] [--as name]        ${a}project → vault${r}
 
 Encrypts the env files of the project into the vault, commits and pushes to GitHub.
   · finds .env, .env.*, .dev.vars, .dev.vars.* up to 4 levels deep (monorepos)
@@ -79,10 +79,15 @@ Encrypts the env files of the project into the vault, commits and pushes to GitH
     sides is asked about (with --yes: yours is saved, the other version stays in
     git history and a warning names its commit)
 
-Project name: --as, else the git origin repo name, else the main worktree folder.
-The vault entry remembers its origin URL (credentials removed): a different repo with
-the same name, or a folder without a git origin, is refused, also with --as. When it
-really is that project (repo renamed or moved): --force, which records the new origin.
+NAME: a project folder under \$ENVORA_PROJECTS (default: the current project).
+The vault entry is named after the git origin repo name, else the main worktree folder
+(--as name to choose it). It remembers its origin URL (credentials removed): a different
+repo with the same name, or a folder without a git origin, is refused. When it really
+is that project (repo renamed or moved): --as <entry> --force, which records the new origin.
+
+A copy this folder never saved or restored (a worktree, a copy made by hand, envora 0.x)
+that differs from the vault is treated as edited on both sides: you are asked (with --yes:
+yours is saved, with a warning). A copy identical to an older vault version is left alone.
 
 Env files you do not want saved (fixtures, copies in build/): list them in a
 .envoraignore file at the project root, one pattern per line (e.g. dist/, */fixtures/*).
@@ -98,7 +103,7 @@ EOF
       ;;
     restore|pull)
       cat <<EOF
-${b}ev restore${r} [name] [-C dir] [--force]        ${a}vault → project${r}
+${b}ev restore${r} [name] [--force]        ${a}vault → project${r}
 
 Writes the saved env files back into the project.
   · identical files are skipped
@@ -108,9 +113,11 @@ Writes the saved env files back into the project.
     (encrypted, ~/.local/state/envora/backups/<project>/, last 10 kept), then replaced;
     --quiet still prints one warning line per replaced file
   · each file is written atomically with mode 600
-  · only env file names are restored, never outside the project folder
-  · refused when the vault entry belongs to another repository (--force if it really
-    is that project, e.g. a fork you work on)
+  · only env file names are restored, never outside the project folder (a link to a
+    file outside is only followed on an explicit yes in a terminal), never into .git
+  · refused when the vault entry belongs to another repository; if it really is that
+    project (e.g. a fork you work on): --as <entry> --force. --force alone only skips
+    the questions, it never picks another repository's entry
 
 NAME outside the project: uses \$ENVORA_PROJECTS/NAME ($(tildify "$ENVORA_PROJECTS")), else the
 folder where NAME was last saved or restored, or whose git origin matches it.
@@ -149,12 +156,16 @@ ${b}ev sync${r}        ${a}vault ↔ GitHub${r}
 Fetches GitHub, integrates other machines' saves, pushes yours.
 Every command already does this; use it after working offline.
 If two machines changed the same file, the most recent save wins; the other version
-stays in git history and the differing keys are listed.
+stays in git history and the differing keys are listed. Two different repositories
+saved under the same name are never merged: sync stops and says how to rename one.
+Files another machine saved with your previous key (after ev rotate) are re-encrypted.
+
+${b}exit codes${r}  0 in sync · 3 commits waiting, GitHub unreachable or refusing · 1 error
 EOF
       ;;
     import|vercel|push-vercel)
       cat <<EOF
-${b}ev import vercel${r} [--env e] [-C dir]        ${a}Vercel → vault${r}
+${b}ev import vercel${r} [--env e]        ${a}Vercel → vault${r}
 
 Snapshots the Vercel env vars of the linked project into the vault, under
 vault/<project>/@vercel/<env>.env. Your project files are never touched.
@@ -164,6 +175,7 @@ vault/<project>/@vercel/<env>.env. Your project files are never touched.
     [SENSITIVE]; envora keeps the value from the previous snapshot when it has one
     (it may be stale) and tells you how many stay unknown
   · snapshots are never restored into the project: ev status --values shows them
+  · the snapshot claims the vault entry for this repository, like ev save
 Uses 'vercel' from PATH, else npx vercel@$VERCEL_PINNED (override: ENVORA_VERCEL_CMD).
 EOF
       ;;
@@ -171,7 +183,7 @@ EOF
       case "$sub" in
         vercel)
           cat <<EOF
-${b}ev export vercel${r} [--env e] [--file f] [--dry-run] [--update-shared] [-C dir]   ${a}vault → Vercel${r}
+${b}ev export vercel${r} [--env e] [--file f] [--dry-run] [--update-shared]   ${a}vault → Vercel${r}
 
 Sends a saved file from the vault to Vercel.
   · default mapping: .env.production → production, .env.preview → preview,
@@ -190,15 +202,20 @@ EOF
           ;;
         *)
           cat <<EOF
-${b}ev export cloudflare${r} [--env e] [--file f] [--dry-run] [-C dir]        ${a}vault → Cloudflare${r}
+${b}ev export cloudflare${r} [--env e] [--file f] [--dry-run]        ${a}vault → Cloudflare${r}
 
 Uploads a saved file from the vault as Worker (or Pages) secrets.
   · without --env: .dev.vars (else .env) goes to the deployed, top-level Worker
-    (Pages: production)
-  · with --env e: .dev.vars.<e> (else .env.<e>) goes to environment e;
-    --file f sends any other saved file
-  · warns when your local file differs from the vault copy (save first?)
-  · plan by names against 'wrangler secret list': add, update, only on Cloudflare (kept)
+    (Pages: production). Only .dev.vars.<e> files saved? they are listed (asked in a
+    terminal)
+  · with --env e: .dev.vars.<e> (else .env.<e>) goes to environment e
+  · --file f sends any other saved file; .dev.vars.<e> / .env.<e> go to environment e
+    (--env= sends them to the deployed Worker instead)
+  · warns when your local file has changes the vault does not have (save first?)
+  · plan by names against 'wrangler secret list': add, update, only on Cloudflare (kept);
+    a Worker never deployed gets created by wrangler with its first secrets
+  · more than 100 secrets go in batches, each one deploys; if one fails, the message
+    says which secrets are already live
   · secrets are piped as JSON to 'wrangler secret bulk' (never written to disk);
     Pages projects use 'wrangler pages secret bulk' (production / preview)
   · this deploys immediately: asks first (--yes to skip, --dry-run for the plan only)
@@ -214,7 +231,7 @@ EOF
       ;;
     forget|clean)
       cat <<EOF
-${b}ev forget${r} [name] [file]        ${a}vault${r}
+${b}ev forget${r} <name> [file]        ${a}vault${r}
 
 Removes a project, or one of its files, from the vault (asks first; --yes in scripts).
 Without a name, in a terminal: pick the project. Old versions remain in git history.
@@ -261,15 +278,16 @@ EOF
       cat <<EOF
 ${b}ev config${r} [get <setting> | set <setting> <value>]
 
-Settings live in ~/.envorarc; ENVORA_* environment variables override them.
-  vault         ENVORA_VAULT      $ENVORA_VAULT
-  key           ENVORA_KEY        $ENVORA_KEY
-  projects      ENVORA_PROJECTS   $ENVORA_PROJECTS
-  repo          ENVORA_REPO       ${ENVORA_REPO:-(not set)}
-  vercel-cmd    ENVORA_VERCEL_CMD
-  wrangler-cmd  ENVORA_WRANGLER_CMD
+Settings live in $(tildify "$(config_rc_path)"); ENVORA_* environment variables override them.
+  vault         ENVORA_VAULT         $(tildify "$ENVORA_VAULT")
+  key           ENVORA_KEY           $(tildify "$ENVORA_KEY")
+  projects      ENVORA_PROJECTS      $(tildify "$ENVORA_PROJECTS")
+  repo          ENVORA_REPO          ${ENVORA_REPO:-(not set)}  (ev init only)
+  vercel-cmd    ENVORA_VERCEL_CMD    ${ENVORA_VERCEL_CMD:-(not set: vercel, else npx vercel@$VERCEL_PINNED)}
+  wrangler-cmd  ENVORA_WRANGLER_CMD  ${ENVORA_WRANGLER_CMD:-(not set: wrangler, else npx wrangler@$WRANGLER_PINNED)}
 The rc file holds KEY=VALUE lines; it is read, never executed. The *-cmd settings are
-split on spaces (no quotes): for anything fancier, point them at a small script.
+split on spaces (no quotes; a leading ~ is expanded): for anything fancier, point them
+at a small script. The vault syncs with its own git remote; repo only serves ev init.
 EOF
       ;;
     *)

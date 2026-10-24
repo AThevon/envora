@@ -26,14 +26,29 @@ FZF_COLORS="fg:#c5cbd3,fg+:#e6e9ed,bg+:#1f2328,hl:#6fcf7c,hl+:#6fcf7c,pointer:#6
 
 # Run "ev ARGS..." as a child process, then wait for a key so its report
 # stays on screen. Never exits the menu; returns 1 when you press q.
+# The exit code is only explained for actions that write somewhere (save,
+# restore, import, export, forget, rotate, sync): doctor and compare already
+# end with their own verdict.
 menu_run() {
   local rc=0 key=""
   printf '\n' >&2
   "$ENVORA_BASH" "$ENVORA_SELF" "$@" || rc=$?
-  case "$rc" in
-    0) ;;
-    3) warn "saved on this machine, not on GitHub yet: use Sync with GitHub when you are online" ;;
-    *) warn "the action did not complete (exit $rc): see the messages above" ;;
+  case "$1" in
+    doctor|status) ;;
+    sync)
+      case "$rc" in
+        0) ;;
+        3) warn "not on GitHub yet: use Sync with GitHub again when you are online" ;;
+        *) warn "the vault is not synced with GitHub: see the messages above" ;;
+      esac
+      ;;
+    *)
+      case "$rc" in
+        0) ;;
+        3) warn "saved on this machine, not on GitHub yet: use Sync with GitHub when you are online" ;;
+        *) warn "the action did not complete: see the messages above" ;;
+      esac
+      ;;
   esac
   printf '\n%spress any key to go back to the menu · q to quit%s' "$C_DIM" "$C_RST" >&2
   IFS= read -rsn1 key </dev/tty 2>/dev/null || true
@@ -88,8 +103,9 @@ menu_pos_of() {
 }
 
 menu_header_project() {
-  local plan="$TMP_ROOT/plan.save" n_vault changed new missing stale conflict parts=()
+  local plan="$TMP_ROOT/plan.save" n_vault changed new missing stale conflict unreached parts=()
   n_vault="$(vault_project_files "$PROJECT_NAME" | grep -c . || true)"
+  unreached=$(($(plan_count "$plan" unreached) + $(plan_count "$plan" badname)))
   changed="$(plan_count "$plan" changed)"
   new="$(plan_count "$plan" new)"
   missing="$(plan_count "$plan" vaultonly)"
@@ -111,6 +127,7 @@ menu_header_project() {
     fi
     state="$(join_by ' · ' "${parts[@]}")"
   fi
+  [[ $unreached -gt 0 ]] && state="$state · ${C_ERR}$(plural "$unreached" "env file") NOT reached (see Save)${C_RST}"
   printf '%s%s%s  %s\n%s%s%s' "$C_BOLD" "$PROJECT_NAME" "$C_RST" "$state" "$C_DIM" "vault: $(vault_sync_label) · ? keys" "$C_RST"
 }
 
@@ -134,26 +151,26 @@ menu_line() {
 }
 
 menu_items_project() {
-  menu_line save "↑" "Save" "project → vault" "encrypt env files"
-  menu_line restore "↓" "Restore" "vault → project" "write them back here"
-  menu_line compare "≈" "Compare" "project ↔ vault" "key names only"
+  menu_line save "↑" "Save" "project → vault" "encrypt this project's env files"
+  menu_line restore "↓" "Restore" "vault → project" "write the saved env files back here"
+  menu_line compare "≈" "Compare" "project ↔ vault" "see what differs (key names only)"
   if vercel_relevant; then
-    menu_line import-vercel "▲" "Import Vercel" "Vercel → vault" "snapshot Vercel vars"
-    menu_line export-vercel "▲" "Send to Vercel" "vault → Vercel" "add / update vars"
+    menu_line import-vercel "▲" "Import Vercel" "Vercel → vault" "snapshot Vercel env vars"
+    menu_line export-vercel "▲" "Send to Vercel" "vault → Vercel" "add / update Vercel env vars"
   fi
   if cloudflare_relevant; then
-    menu_line export-cloudflare "☁" "Send to Cloudflare" "vault → Cloudflare" "$(cloudflare_kinds) secrets"
+    menu_line export-cloudflare "☁" "Send to Cloudflare" "vault → Cloudflare" "upload $(cloudflare_kinds) secrets"
   fi
   menu_items_global
 }
 
 menu_items_global() {
   printf 'sep\t%s%s%s\n' "$C_DIM" "──────────────────────────────── whole vault" "$C_RST"
-  menu_line browse "≡" "Browse vault" "vault" "every saved project" dim
-  menu_line sync "⇅" "Sync with GitHub" "vault ↔ GitHub" "pull + push now" dim
-  menu_line doctor "✚" "Doctor" "" "check the setup" dim
-  menu_line config "⚙" "Settings" "" "paths and repo" dim
-  menu_line rotate "⟳" "Rotate key" "vault" "new key, re-encrypt" dim
+  menu_line browse "≡" "Browse vault" "vault" "every saved project, clone + restore" dim
+  menu_line sync "⇅" "Sync with GitHub" "vault ↔ GitHub" "bring in other machines' saves, push" dim
+  menu_line doctor "✚" "Doctor" "" "check the setup, with a fix for each problem" dim
+  menu_line config "⚙" "Settings" "" "paths and commands" dim
+  menu_line rotate "⟳" "Rotate key" "vault" "new key, re-encrypt everything" dim
 }
 
 # The folder the menu acts on: -C, else the current folder (in a monorepo,
@@ -273,7 +290,7 @@ menu_vault_project() {
   if [[ -n "$dir" ]]; then
     items="$(menu_line v-restore "↓" "Restore" "vault → project" "into $(tildify "$dir")")"$'\n'"$(menu_line v-compare "≈" "Compare" "project ↔ vault" "key names only")"
   elif [[ -n "$origin" && ! -e "$target" ]]; then
-    items="$(menu_line v-clone "↓" "Clone + restore" "GitHub + vault" "into $(tildify "$target")")"
+    items="$(menu_line v-clone "↓" "Clone + restore" "GitHub + vault → project" "into $(tildify "$target")")"
   elif [[ -n "$origin" ]]; then
     items="v-none"$'\t'"${C_DIM}·  $(tildify "$target") exists but is another project: clone $name elsewhere, then ev restore -C <dir>${C_RST}"
   else
@@ -342,7 +359,7 @@ menu_preview() {
     restore) preview_project && preview_restore ;;
     compare)
       preview_project && {
-        preview_title "≈ Compare" "project ↔ vault" "what differs between your files and the vault (key names only)"
+        preview_title "≈ Compare  (ev status)" "project ↔ vault" "what differs between your files and the vault (key names only)"
         save_plan
         status_report
       }
@@ -430,7 +447,7 @@ preview_origin_ok() {
 }
 
 preview_save() {
-  preview_title "↑ Save" "project → vault" "encrypt the env files of $PROJECT_NAME into the vault, then push to GitHub"
+  preview_title "↑ Save  (ev save)" "project → vault" "encrypt the env files of $PROJECT_NAME into the vault, then push to GitHub"
   preview_origin_ok || return 0
   save_plan
   local plan="$TMP_ROOT/plan.save" st rel any=0
@@ -455,21 +472,28 @@ preview_save() {
       stale) out "  ${C_WARN}↓${C_RST} $rel  ${C_DIM}newer in the vault, unchanged here since your last save/restore → skipped (use Restore)${C_RST}" ;;
       tracked) out "  ${C_DIM}· $rel  tracked by git, skipped${C_RST}" ;;
       vaultonly) out "  ${C_DIM}· $rel  only in the vault, kept there${C_RST}" ;;
+      unreached) out "  ${C_ERR}!${C_RST} $rel  ${C_DIM}NOT reached ($(unreached_reason "$rel")): move it up, or list it in .envoraignore${C_RST}" ;;
+      badname) out "  ${C_ERR}!${C_RST} $rel  ${C_DIM}NOT saved: a newline or tab in its path (rename it)${C_RST}" ;;
     esac
   done <"$plan"
   out ""
+  local n_out
+  n_out=$(($(plan_count "$plan" unreached) + $(plan_count "$plan" badname)))
+  if [[ $n_out -gt 0 ]]; then
+    out "${C_ERR}$(plural "$n_out" "env file") of this folder would NOT be in the vault: do not delete the folder (the wipe hook refuses)${C_RST}"
+  fi
   if [[ $any == 1 ]]; then
     out "then: commit in the vault and push to GitHub"
     out "${C_DIM}vault: $(tildify "$ENVORA_VAULT/$PROJECT_NAME")${C_RST}"
   elif [[ ! -s "$plan" ]]; then
     out "no env files found in this project (.env, .env.*, .dev.vars...)"
-  else
+  elif [[ $n_out -eq 0 ]]; then
     out "${C_ACC}nothing to save: the vault is up to date${C_RST}"
   fi
 }
 
 preview_restore() {
-  preview_title "↓ Restore" "vault → project" "write the saved env files of $PROJECT_NAME back into $(tildify "$PROJECT_DIR")"
+  preview_title "↓ Restore  (ev restore)" "vault → project" "write the saved env files of $PROJECT_NAME back into $(tildify "$PROJECT_DIR")"
   preview_origin_ok || return 0
   restore_plan
   local plan="$TMP_ROOT/plan.restore" st rel any=0
@@ -510,7 +534,7 @@ preview_restore() {
 }
 
 preview_import_vercel() {
-  preview_title "▲ Import Vercel" "Vercel → vault" "snapshot the Vercel env vars into the vault (your files are not touched)"
+  preview_title "▲ Import Vercel  (ev import vercel)" "Vercel → vault" "snapshot the Vercel env vars into the vault (your files are not touched)"
   local dirs d rel snaps
   dirs="$(vercel_dirs)"
   if [[ -z "$dirs" ]]; then
@@ -546,7 +570,7 @@ preview_pick() {
 }
 
 preview_export_vercel() {
-  preview_title "▲ Send to Vercel" "vault → Vercel" "add / update Vercel env vars from a file saved in the vault"
+  preview_title "▲ Send to Vercel  (ev export vercel)" "vault → Vercel" "add / update Vercel env vars from a file saved in the vault"
   preview_origin_ok || return 0
   local dirs pdir reldir e f any=0
   dirs="$(vercel_dirs)"
@@ -566,7 +590,7 @@ preview_export_vercel() {
   for e in production preview development; do
     f="$(in_dir "$reldir" ".env.$e")"
     if [[ -f "$ENVORA_VAULT/$PROJECT_NAME/$f.age" ]]; then
-      out "  vault/$PROJECT_NAME/$f  ${C_ACC}→${C_RST} Vercel $e  ${C_DIM}($(decrypt_stream "$ENVORA_VAULT/$PROJECT_NAME/$f.age" 2>/dev/null | dotenv_keys | grep -c . || true) vars)${C_RST}"
+      out "  vault/$PROJECT_NAME/$f  ${C_ACC}→${C_RST} Vercel $e  ${C_DIM}($(plural "$(decrypt_stream "$ENVORA_VAULT/$PROJECT_NAME/$f.age" 2>/dev/null | dotenv_keys | grep -c . || true)" var))${C_RST}"
       any=1
     fi
   done
@@ -578,7 +602,7 @@ preview_export_vercel() {
 }
 
 preview_export_cloudflare() {
-  preview_title "☁ Send to Cloudflare" "vault → Cloudflare" "upload a saved file as Worker / Pages secrets"
+  preview_title "☁ Send to Cloudflare  (ev export cloudflare)" "vault → Cloudflare" "upload a saved file as Worker / Pages secrets"
   preview_origin_ok || return 0
   local dirs d reldir file keys target
   dirs="$(cloudflare_dirs)"
@@ -626,7 +650,7 @@ preview_export_cloudflare() {
 }
 
 preview_browse() {
-  preview_title "≡ Browse vault" "vault" "every project saved in the vault"
+  preview_title "≡ Browse vault  (ev list)" "vault" "every project saved in the vault"
   local name n dir
   while IFS= read -r name; do
     [[ -z "$name" ]] && continue
@@ -640,7 +664,7 @@ EOF
 }
 
 preview_sync() {
-  preview_title "⇅ Sync with GitHub" "vault ↔ GitHub" "pull the other machines' saves, push yours"
+  preview_title "⇅ Sync with GitHub  (ev sync)" "vault ↔ GitHub" "bring in the other machines' saves, push yours"
   if vault_has_remote; then
     out "  remote: $(sanitize_origin "$(vgit remote get-url origin)")"
     out "  state:  $(vault_sync_label) ${C_DIM}(as of the last fetch)${C_RST}"
@@ -654,7 +678,7 @@ preview_sync() {
 preview_rotate() {
   local n
   n="$(find "$ENVORA_VAULT" -type f -name '*.age' ! -path '*/.git/*' | grep -c . || true)"
-  preview_title "⟳ Rotate key" "vault" "create a new key and re-encrypt the $(plural "$n" file) of the vault"
+  preview_title "⟳ Rotate key  (ev rotate)" "vault" "create a new key and re-encrypt the $(plural "$n" file) of the vault"
   out "  1. new key generated next to the current one"
   out "  2. every file re-encrypted and verified"
   out "  3. old key kept as $(basename "$ENVORA_KEY").bak-<date>"
@@ -694,7 +718,7 @@ preview_vault_restore() {
   local name="$1" item="$2" dir="${ENVORA_MENU_PROJECT_DIR:-}"
   valid_name "$name" || return 0
   if [[ "$item" == v-clone ]]; then
-    out "${C_BOLD}Clone + restore${C_RST}"
+    out "${C_BOLD}Clone + restore${C_RST}   ${C_ACC}GitHub + vault → project${C_RST}"
     out ""
     out "  1. git clone $(entry_origin "$name") $(tildify "$(clone_target "$name")")"
     out "  2. restore its env files from the vault:"
