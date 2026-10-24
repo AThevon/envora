@@ -1574,6 +1574,189 @@ t_help_and_doctor() {
   assert_contains "$OUT" "fzf 0.44.1 is too old for the menu"
 }
 
+# --- round 2: sync, identity, safety -----------------------------------------
+
+t_sync_lost_conflict_is_not_stale() {
+  local key="$T/A/home/.age/key.txt" p pb
+  p="$(mkproject app)"
+  printf 'A=1\n' >"$p/.env"
+  (cd "$p" && expect_rc 0 save -q -y)
+  new_machine B "$key"
+  pb="$(mkproject app)"
+  (cd "$pb" && expect_rc 0 restore -q -y)
+  # B saves offline (older), A saves later (newer): A wins the sync conflict
+  printf 'A=1\nB_ONLY=b\n' >"$pb/.env"
+  (cd "$pb" && GIT_COMMITTER_DATE="2026-01-01T10:00:00" GIT_AUTHOR_DATE="2026-01-01T10:00:00" expect_rc 3 save --no-sync -q -y)
+  use_machine A
+  printf 'A=1\nA_ONLY=a\n' >"$p/.env"
+  (cd "$p" && GIT_COMMITTER_DATE="2026-01-01T11:00:00" GIT_AUTHOR_DATE="2026-01-01T11:00:00" expect_rc 0 save -q -y)
+  use_machine B
+  # B's copy was edited here: never "unchanged here, newer in the vault"
+  expect_rc 0 status -C "$pb"
+  assert_contains "$OUT" "kept the other machine's version"
+  assert_contains "$OUT" "changed here AND in the vault"
+  assert_not_contains "$OUT" "unchanged since"
+  # restore asks / backs up instead of updating it silently as "stale"
+  expect_rc 0 restore -C "$pb" -q -y
+  assert_contains "$OUT" "differed from the vault: replaced by the vault version (backup: "
+  printf 'A=1\nB_ONLY=b\n' >"$pb/.env"
+  # the wipe hook: exit 0 means the folder's contents ARE the vault's version
+  expect_rc 0 save -C "$pb" --yes --quiet
+  assert_eq "$(age -d -i "$key" "$ENVORA_VAULT/app/.env.age")" "$(printf 'A=1\nB_ONLY=b')"
+  assert_eq "$(remote_commits)" "$(commits)"
+}
+
+t_sync_push_race_never_claims_saved() {
+  local key="$T/A/home/.age/key.txt" p pb x
+  p="$(mkproject app)"
+  printf 'A=1\n' >"$p/.env"
+  (cd "$p" && expect_rc 0 save -q -y)
+  new_machine B "$key"
+  pb="$(mkproject app)"
+  (cd "$pb" && expect_rc 0 restore -q -y)
+  # A's newer commit reaches GitHub between B's fetch and B's push
+  use_machine A
+  printf 'A=1\nFROM_A=yes\n' >"$p/.env"
+  (cd "$p" && GIT_COMMITTER_DATE="2026-01-01T11:00:00" expect_rc 3 save -q -y --no-sync)
+  x="$(git -C "$ENVORA_VAULT" rev-parse HEAD)"
+  git -C "$ENVORA_VAULT" push -q origin HEAD:refs/heads/side
+  cat >"$T/remote.git/hooks/pre-receive" <<HOOK
+#!/bin/sh
+if [ ! -f "$T/raced" ]; then
+  touch "$T/raced"
+  unset GIT_QUARANTINE_PATH
+  git update-ref refs/heads/main $x
+  echo "someone pushed first" >&2
+  exit 1
+fi
+exit 0
+HOOK
+  chmod +x "$T/remote.git/hooks/pre-receive"
+  use_machine B
+  printf 'A=1\nFROM_B=yes\n' >"$pb/.env"
+  GIT_COMMITTER_DATE="2026-01-01T10:00:00" expect_rc 1 save -C "$pb" --yes
+  assert_contains "$OUT" "another machine saved a different version at the same moment"
+  assert_not_contains "$OUT" "saved to the vault (app) · pushed"
+  # saving again keeps this folder's version (it was edited here)
+  expect_rc 0 save -C "$pb" --yes --quiet
+  assert_eq "$(age -d -i "$key" "$ENVORA_VAULT/app/.env.age")" "$(printf 'A=1\nFROM_B=yes')"
+}
+
+t_sync_rotate_race_keeps_other_save() {
+  local key="$T/A/home/.age/key.txt" p pb x
+  p="$(mkproject app)"
+  printf 'TOKEN=v1\n' >"$p/.env"
+  (cd "$p" && expect_rc 0 save -q -y)
+  new_machine B "$key"
+  pb="$(mkproject app)"
+  (cd "$pb" && expect_rc 0 restore -q -y)
+  printf 'TOKEN=v2-from-B\n' >"$pb/.env"
+  (cd "$pb" && GIT_COMMITTER_DATE="2026-01-01T10:00:00" expect_rc 3 save -q -y --no-sync)
+  x="$(git -C "$ENVORA_VAULT" rev-parse HEAD)"
+  git -C "$ENVORA_VAULT" push -q origin HEAD:refs/heads/side
+  cat >"$T/remote.git/hooks/pre-receive" <<HOOK
+#!/bin/sh
+if [ ! -f "$T/raced" ]; then
+  touch "$T/raced"
+  unset GIT_QUARANTINE_PATH
+  git update-ref refs/heads/main $x
+  exit 1
+fi
+exit 0
+HOOK
+  chmod +x "$T/remote.git/hooks/pre-receive"
+  # A rotates (a newer commit that changes no value): B's edit must survive
+  use_machine A
+  expect_rc 0 rotate --yes
+  assert_not_contains "$OUT" "conflict on"
+  git clone -q "$T/remote.git" "$T/check"
+  assert_eq "$(age -d -i "$ENVORA_KEY" "$T/check/app/.env.age")" "TOKEN=v2-from-B"
+}
+
+t_two_folders_one_project_never_revert() {
+  local p wt
+  p="$(mkproject app)"
+  printf 'TOKEN=old\n' >"$p/.env"
+  (cd "$p" && expect_rc 0 save -q -y)
+  wt="$ENVORA_PROJECTS/app-wt"
+  git -C "$p" worktree add -q "$wt" -b wt 2>/dev/null
+  expect_rc 0 restore -C "$wt" -q -y
+  printf 'TOKEN=new-rotated\n' >"$wt/.env"
+  expect_rc 0 save -C "$wt" -q -y
+  # the main copy was never edited: it is behind, not newer
+  expect_rc 0 status -C "$p"
+  assert_contains "$OUT" "newer in the vault"
+  expect_rc 0 save -C "$p" --yes --quiet
+  assert_eq "$(age -d -i "$ENVORA_KEY" "$ENVORA_VAULT/app/.env.age")" "TOKEN=new-rotated"
+}
+
+t_sync_interrupt_never_leaves_a_merge() {
+  local key="$T/A/home/.age/key.txt" p pb real pid gd rc=0
+  p="$(mkproject app)"
+  printf 'A=1\n' >"$p/.env"
+  (cd "$p" && expect_rc 0 save -q -y)
+  new_machine B "$key"
+  pb="$(mkproject app)"
+  (cd "$pb" && expect_rc 0 restore -q -y)
+  printf 'A=1\nB=1\n' >"$pb/.env"
+  (cd "$pb" && expect_rc 3 save -q -y --no-sync)
+  use_machine A
+  printf 'A=1\nAA=1\n' >"$p/.env"
+  (cd "$p" && expect_rc 0 save -q -y)
+  use_machine B
+  # a slow decryption keeps the conflict resolution running
+  real="$(command -v age)"
+  mkdir -p "$T/slow"
+  printf '#!/bin/sh\nfor a in "$@"; do [ "$a" = -d ] && [ -f "%s/slow/on" ] && sleep 2; done\nexec "%s" "$@"\n' "$T" "$real" >"$T/slow/age"
+  chmod +x "$T/slow/age"
+  touch "$T/slow/on"
+  # job control: the job gets its own process group and keeps SIGINT (a
+  # non-interactive shell starts background jobs with SIGINT ignored)
+  set -m
+  PATH="$T/slow:$PATH" "$TEST_BASH" "$EV" sync </dev/null >/dev/null 2>&1 &
+  pid=$!
+  sleep 1
+  kill -INT -- "-$pid"
+  wait "$pid" || rc=$?
+  set +m
+  rm -f "$T/slow/on"
+  assert_eq "$rc" "130"
+  gd="$(git -C "$ENVORA_VAULT" rev-parse --absolute-git-dir)"
+  assert_no_file "$gd/MERGE_HEAD"
+  assert_no_file "$gd/rebase-merge"
+  assert_eq "$(git -C "$ENVORA_VAULT" status --porcelain)" ""
+}
+
+t_unicode_and_quote_paths_sync() {
+  local key="$T/A/home/.age/key.txt" p pb d
+  p="$(mkproject app)"
+  mkdir -p "$p/café" "$p/q\"uote"
+  printf 'X=1\n' >"$p/café/.env"
+  printf 'Q=1\n' >"$p/q\"uote/.env"
+  (cd "$p" && expect_rc 0 save -q -y)
+  new_machine B "$key"
+  pb="$(mkproject app)"
+  (cd "$pb" && expect_rc 0 restore -q -y)
+  printf 'X=B\n' >"$pb/café/.env"
+  printf 'Q=B\n' >"$pb/q\"uote/.env"
+  (cd "$pb" && GIT_COMMITTER_DATE="2026-01-01T10:00:00" expect_rc 3 save -q -y --no-sync)
+  use_machine A
+  printf 'X=A\n' >"$p/café/.env"
+  printf 'Q=A\n' >"$p/q\"uote/.env"
+  (cd "$p" && GIT_COMMITTER_DATE="2026-01-01T11:00:00" expect_rc 0 save -q -y)
+  use_machine B
+  expect_rc 0 sync
+  assert_contains "$OUT" "conflict on app/café/.env.age"
+  assert_eq "$(git -C "$ENVORA_VAULT" status --porcelain)" ""
+  (cd "$pb" && expect_rc 0 save -q -y)
+  # a stray file the key cannot decrypt is never committed, whatever its path
+  d="$ENVORA_VAULT/app/café"
+  printf 'EVIL=1\n' | age -r "$(age-keygen 2>/dev/null | age-keygen -y)" -o "$d/.env.local.age"
+  expect_rc 1 status -C "$pb"
+  assert_contains "$OUT" "your key cannot decrypt"
+  assert_not_contains "$(git -C "$ENVORA_VAULT" log --stat -1)" ".env.local.age"
+}
+
 # --- run ---------------------------------------------------------------------
 
 echo "envora tests · $("$TEST_BASH" -c 'echo "bash $BASH_VERSION"') · $(age --version)"

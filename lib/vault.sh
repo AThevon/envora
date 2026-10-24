@@ -10,8 +10,50 @@ SYNC_STATE=""      # synced | offline | skipped | noremote | empty
 SYNC_PULLED=0      # commits integrated by the last pull
 SYNC_PUSHED=0      # commits pushed by the last push
 
+# Paths are literal (a folder named "[x]" is not a glob) and printed raw
+# (core.quotePath=false); lists of paths are always read NUL-separated, so
+# names with accents, quotes or spaces are handled like any other.
 vgit() {
-  GIT_EDITOR=true GIT_TERMINAL_PROMPT=0 git -C "$ENVORA_VAULT" "$@"
+  GIT_EDITOR=true GIT_TERMINAL_PROMPT=0 GIT_LITERAL_PATHSPECS=1 \
+    git -c core.quotePath=false -C "$ENVORA_VAULT" "$@"
+}
+
+# NUL-separated git output -> one path per line (envora refuses newlines in paths)
+nul_lines() {
+  tr '\0' '\n'
+}
+
+# A git operation that must never be left half done (see ev_cleanup).
+VAULT_GIT_OP=""
+vault_abort_op() {
+  local op="$VAULT_GIT_OP"
+  VAULT_GIT_OP=""
+  case "$op" in
+    rebase) vgit rebase --abort >/dev/null 2>&1 || true ;;
+    merge) vgit merge --abort >/dev/null 2>&1 || true ;;
+  esac
+}
+
+# Blobs of files whose version from this machine lost a sync conflict: such a
+# file is never "unchanged here, newer in the vault" (it was edited here).
+lost_file() {
+  printf '%s/lost-blobs' "$ENVORA_STATE"
+}
+
+lost_record() {
+  local f
+  [[ -n "$1" ]] || return 0
+  f="$(lost_file)"
+  mkdir -p "$(dirname "$f")" 2>/dev/null || return 0
+  printf '%s\n' "$1" >>"$f" 2>/dev/null || return 0
+  if [[ "$(grep -c . "$f" 2>/dev/null || echo 0)" -gt 500 ]]; then
+    tail -n 300 "$f" >"$f.envora-tmp" 2>/dev/null && mv -f "$f.envora-tmp" "$f"
+  fi
+  return 0
+}
+
+is_lost_blob() {
+  [[ -n "$1" ]] && grep -Fxq -- "$1" "$(lost_file)" 2>/dev/null
 }
 
 vault_exists() {
@@ -138,7 +180,7 @@ vault_repair() {
   while IFS= read -r p; do
     case "$p" in *.age) ;; *) continue ;; esac
     decrypts_with_key "$ENVORA_VAULT/$p" || unreadable[${#unreadable[@]}]="$p"
-  done < <(vgit diff --cached --name-only --diff-filter=AM 2>/dev/null)
+  done < <(vgit diff --cached --name-only -z --diff-filter=AM 2>/dev/null | nul_lines)
   if [[ ${#unreadable[@]} -gt 0 ]]; then
     vgit reset -q -- . >/dev/null 2>&1 || true
     err "the vault has $(plural ${#unreadable[@]} file) left uncommitted that your key cannot decrypt: $(short_list 3 "${unreadable[@]}")"
@@ -251,22 +293,33 @@ vault_pull() {
       err "cannot update the vault: $(head -n 1 "$TMP_ROOT/git.err")"
       return 1
     }
-  elif ! vgit rebase -q --autostash "$up" >"$TMP_ROOT/git.err" 2>&1; then
-    vgit rebase --abort >/dev/null 2>&1 || true
-    vault_merge_resolve "$up" || return 1
+  else
+    VAULT_GIT_OP=rebase
+    if ! vgit rebase -q --autostash "$up" >"$TMP_ROOT/git.err" 2>&1; then
+      vault_abort_op
+      VAULT_GIT_OP=merge
+      if ! vault_merge_resolve "$up"; then
+        VAULT_GIT_OP=""
+        return 1
+      fi
+    fi
+    VAULT_GIT_OP=""
   fi
   SYNC_PULLED="$behind"
   return 0
 }
 
-# Integrate diverging histories when a rebase conflicts: per conflicting
-# encrypted file, identical plaintexts are merged silently, otherwise the most
-# recently committed version wins and the other stays in git history.
+# Integrate diverging histories when a rebase conflicts. Per conflicting
+# encrypted file, the plaintexts are compared three ways (with the common
+# ancestor): a side that did not change the content (identical, or only
+# re-encrypted by ev rotate) gives way to the side that did. Only when both
+# changed it does the most recently committed version win; the other one
+# stays in git history and the differing keys are listed.
 vault_merge_resolve() {
   local up="$1" p resolved=()
   vgit merge --no-ff --no-commit -q "$up" >"$TMP_ROOT/merge.out" 2>&1 || true
   local conflicts
-  conflicts="$(vgit diff --name-only --diff-filter=U 2>/dev/null)"
+  conflicts="$(vgit diff --name-only -z --diff-filter=U 2>/dev/null | nul_lines)"
   if [[ -z "$conflicts" ]]; then
     if [[ -f "$(vgit rev-parse --absolute-git-dir)/MERGE_HEAD" ]]; then
       vgit commit -q -m "sync: merge changes from another machine" 2>"$TMP_ROOT/git.err" || {
@@ -300,7 +353,7 @@ vault_merge_resolve() {
   done <<EOF
 $conflicts
 EOF
-  if [[ -n "$(vgit diff --name-only --diff-filter=U 2>/dev/null)" ]]; then
+  if [[ -n "$(vgit diff --name-only -z --diff-filter=U 2>/dev/null | nul_lines)" ]]; then
     vgit merge --abort >/dev/null 2>&1 || true
     err "could not resolve the vault conflict automatically; the vault is unchanged"
     return 1
@@ -313,9 +366,16 @@ EOF
   return 0
 }
 
+# Plaintext of a conflict stage (1 ancestor, 2 this machine, 3 the other one),
+# in a pipe: never written to disk.
+stage_plain() {
+  vgit show ":$1:$2" 2>/dev/null | age -d "${ID_ARGS[@]}" 2>/dev/null
+}
+
 vault_resolve_age() {
-  local up="$1" p="$2" stages has2=0 has3=0
-  stages="$(vgit ls-files -u -- "$p" | awk '{print $3}')"
+  local up="$1" p="$2" stages has1=0 has2=0 has3=0
+  stages="$(vgit ls-files -u -z -- "$p" | nul_lines | awk '{print $3}')"
+  case "$stages" in *1*) has1=1 ;; esac
   case "$stages" in *2*) has2=1 ;; esac
   case "$stages" in *3*) has3=1 ;; esac
   if [[ $has2 == 0 ]]; then
@@ -328,37 +388,45 @@ vault_resolve_age() {
     warn "conflict on $p: deleted on another machine, changed here: kept the changed version"
     return 0
   fi
-  local f_ours="$TMP_ROOT/conflict.ours" f_theirs="$TMP_ROOT/conflict.theirs" same=0
   [[ ${#ID_ARGS[@]} -gt 0 ]] || load_identities
-  if ! vgit show ":2:$p" 2>/dev/null | age -d "${ID_ARGS[@]}" >"$f_ours" 2>/dev/null ||
-    ! vgit show ":3:$p" 2>/dev/null | age -d "${ID_ARGS[@]}" >"$f_theirs" 2>/dev/null; then
-    rm -f "$f_ours" "$f_theirs"
+  local s_ours s_theirs s_base=""
+  if ! s_ours="$(stage_plain 2 "$p" | cksum)" || ! s_theirs="$(stage_plain 3 "$p" | cksum)"; then
     err "conflict on $p: one of the two versions is encrypted for a key this machine does not have, so they cannot be compared"
     say "  the vault is unchanged. Import the right key (ev init --import-key), then run ev sync"
     return 1
   fi
-  if cmp -s "$f_ours" "$f_theirs"; then
-    same=1
+  if [[ $has1 == 1 ]]; then
+    s_base="$(stage_plain 1 "$p" | cksum)" || s_base=""
   fi
-  if [[ $same == 1 ]]; then
-    vgit checkout -q --ours -- "$p" && vgit add -f -- "$p"
-    rm -f "$f_ours" "$f_theirs"
+  local keep=""
+  if [[ "$s_ours" == "$s_theirs" ]]; then
+    keep=ours
+  elif [[ -n "$s_base" && "$s_ours" == "$s_base" ]]; then
+    keep=theirs # only the other machine changed the content
+  elif [[ -n "$s_base" && "$s_theirs" == "$s_base" ]]; then
+    keep=ours # only this machine changed it
+  fi
+  if [[ -n "$keep" ]]; then
+    vgit checkout -q "--$keep" -- "$p" && vgit add -f -- "$p" || return 1
     return 0
   fi
-  local t_ours t_theirs keep other_ref other_label kept_label
+  # Both machines changed the content: the most recent save wins.
+  local t_ours t_theirs other_ref other_label kept_label
   t_ours="$(vgit log -1 --format=%ct HEAD -- "$p" 2>/dev/null || echo 0)"
   t_theirs="$(vgit log -1 --format=%ct "$up" -- "$p" 2>/dev/null || echo 0)"
   if [[ "${t_ours:-0}" -gt "${t_theirs:-0}" ]]; then
-    keep=ours other_ref="$up" kept_label="this machine's" other_label="the other machine"
+    keep=ours other_ref="$up" kept_label="this machine's version" other_label="the other machine"
   else
-    keep=theirs other_ref="HEAD" kept_label="other machine's" other_label="this machine"
+    keep=theirs other_ref="HEAD" kept_label="the other machine's version" other_label="this machine"
+    # Remember it: the project copy that made this version is not "unchanged".
+    lost_record "$(vgit rev-parse -q --verify ":2:$p" 2>/dev/null || true)"
+    printf '%s\n' "$p" >>"$TMP_ROOT/conflict.lost"
   fi
-  vgit checkout -q "--$keep" -- "$p" && vgit add -f -- "$p" || return 1
   local other_commit details=""
   other_commit="$(vgit log -1 --format=%h "$other_ref" -- "$p" 2>/dev/null)"
-  details="$({ dotenv_json a <"$f_ours"; dotenv_json b <"$f_theirs"; } | dotenv_diff_stream | key_diff_summary "this machine" "the other machine")"
-  rm -f "$f_ours" "$f_theirs"
-  warn "conflict on $p: kept the $kept_label version (most recent save); $details. The version from $other_label stays in git history (commit $other_commit)."
+  details="$({ stage_plain 2 "$p" | dotenv_json a; stage_plain 3 "$p" | dotenv_json b; } | dotenv_diff_stream | key_diff_summary "this machine" "the other machine")"
+  vgit checkout -q "--$keep" -- "$p" && vgit add -f -- "$p" || return 1
+  warn "conflict on $p: kept $kept_label (most recent save); $details. The version from $other_label stays in git history (commit $other_commit)."
   return 0
 }
 
@@ -457,7 +525,7 @@ vault_sync_label() {
 # Everything a command needs before touching the vault.
 vault_ready() {
   if ! vault_exists; then
-    err "no vault at $ENVORA_VAULT (run 'ev init')"
+    err "no vault at $(tildify "$ENVORA_VAULT") (run 'ev init')"
     return 1
   fi
   return 0

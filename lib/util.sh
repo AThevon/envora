@@ -7,6 +7,11 @@ CLEANUP_LIST=""
 
 ev_cleanup() {
   local p old_ifs="$IFS"
+  # Interrupted in the middle of a vault rebase / merge: undo it before the
+  # lock goes away, so the vault is never left half merged.
+  if [[ -n "${VAULT_GIT_OP:-}" ]]; then
+    vault_abort_op 2>/dev/null || true
+  fi
   set -f
   IFS=$'\n'
   for p in $CLEANUP_LIST; do

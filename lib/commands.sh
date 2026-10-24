@@ -8,14 +8,31 @@
 
 # --- shared ------------------------------------------------------------------
 
-# The "base" of a file is the vault version this machine last saved or
+# The "base" of a file is the vault version this folder last saved or
 # restored (the git blob of its .age, under ~/.local/state/envora/base/).
+# It is kept per project folder: two worktrees or clones of one project each
+# know which vault version they last synced.
 # When the vault copy is no longer the base AND the project copy differs from
-# it, another machine saved a newer version meanwhile: saving this copy would
-# silently undo that change, so save asks (or warns loudly with --yes).
+# it, another machine (or folder) saved a newer version meanwhile: saving this
+# copy would silently undo that change, so save asks (or warns loudly with --yes).
+
+base_dir_key() {
+  printf '%s' "$PROJECT_DIR" | cksum | awk '{print "@dir-" $1}'
+}
 
 base_file() {
-  printf '%s/base/%s/%s' "$ENVORA_STATE" "$PROJECT_NAME" "$1"
+  printf '%s/base/%s/%s/%s' "$ENVORA_STATE" "$PROJECT_NAME" "$(base_dir_key)" "$1"
+}
+
+# Base blob of REL for this folder (envora 1.0.0 betas kept one per project).
+base_blob() {
+  local f
+  f="$(base_file "$1")"
+  if [[ ! -f "$f" ]]; then
+    f="$ENVORA_STATE/base/$PROJECT_NAME/$1"
+    [[ -f "$f" ]] || return 0
+  fi
+  head -n 1 "$f" 2>/dev/null || true
 }
 
 vault_blob() {
@@ -32,35 +49,38 @@ base_record() {
 }
 
 # The project copy of REL differs from the vault copy. Why?
-#   changed   edited here, the vault did not move since this machine synced it
+#   changed   edited here, the vault did not move since this folder synced it
 #   stale     the vault has a newer version and this copy was not edited since
-#   conflict  edited here AND a newer version in the vault (another machine)
+#   conflict  edited here AND a newer version in the vault (another machine),
+#             or the version saved from here lost a sync conflict
 # The base version is read back from git history and decrypted in a pipe
-# (with old keys too after a rotation): no plaintext is ever stored for it.
+# (with old keys too after a rotation); only checksums are compared, so no
+# plaintext is ever stored, even if the process is killed.
 classify_change() {
-  local rel="$1" f b bp="$TMP_ROOT/base.plain" r
-  f="$(base_file "$rel")"
-  [[ -f "$f" ]] || { printf 'changed'; return 0; }
-  b="$(head -n 1 "$f" 2>/dev/null)"
+  local rel="$1" b s_base s_vault s_here
+  b="$(base_blob "$rel")"
   if [[ -z "$b" || "$b" == "$(vault_blob "$rel")" ]]; then
     printf 'changed'
     return 0
   fi
-  [[ ${#ID_ARGS[@]} -gt 0 ]] || load_identities
-  if ! vgit cat-file blob "$b" 2>/dev/null | age -d "${ID_ARGS[@]}" >"$bp" 2>/dev/null; then
-    rm -f "$bp"
+  if is_lost_blob "$b"; then
     printf 'conflict'
     return 0
   fi
-  if decrypt_stream "$ENVORA_VAULT/$PROJECT_NAME/$rel.age" 2>/dev/null | cmp -s - "$bp"; then
-    r=changed # only re-encrypted (ev rotate): same content
-  elif cmp -s "$bp" "$PROJECT_DIR/$rel"; then
-    r=stale
-  else
-    r=conflict
+  [[ ${#ID_ARGS[@]} -gt 0 ]] || load_identities
+  if ! s_base="$(vgit cat-file blob "$b" 2>/dev/null | age -d "${ID_ARGS[@]}" 2>/dev/null | cksum)"; then
+    printf 'conflict'
+    return 0
   fi
-  rm -f "$bp"
-  printf '%s' "$r"
+  s_vault="$(decrypt_any "$ENVORA_VAULT/$PROJECT_NAME/$rel.age" 2>/dev/null | cksum)" || s_vault=""
+  s_here="$(cksum <"$PROJECT_DIR/$rel" 2>/dev/null)" || s_here=""
+  if [[ "$s_vault" == "$s_base" ]]; then
+    printf 'changed' # only re-encrypted (ev rotate): same content
+  elif [[ "$s_here" == "$s_base" ]]; then
+    printf 'stale'
+  else
+    printf 'conflict'
+  fi
 }
 
 # "commit abc1234, 2 hours ago" for the last vault change of REL
@@ -225,7 +245,7 @@ cmd_save() {
 
   save_plan
   local plan="$TMP_ROOT/plan.save" base="$ENVORA_VAULT/$PROJECT_NAME"
-  local rel st d saved=() failed=0 n_new=0 n_changed=0 n_skipped=0 n_stale=0
+  local rel st d saved=() saved_blobs=() failed=0 n_new=0 n_changed=0 n_skipped=0 n_stale=0
   : >"$TMP_ROOT/save.decisions"
   save_ask_conflicts || return 1
 
@@ -234,7 +254,7 @@ cmd_save() {
       same) base_record "$rel" ;;
       stale)
         n_stale=$((n_stale + 1))
-        step "$rel  ${C_DIM}not edited here, the vault has a newer version ($(vault_file_commit "$rel")): kept it (ev restore brings it here)${C_RST}"
+        step "$rel  ${C_DIM}unchanged here since its last save/restore, the vault has a newer version ($(vault_file_commit "$rel")): kept it (ev restore brings it here)${C_RST}"
         ;;
       conflict)
         d="$(save_decision "$rel")"
@@ -256,6 +276,7 @@ cmd_save() {
         fi
         if encrypt_file "$PROJECT_DIR/$rel" "$base/$rel.age"; then
           saved[${#saved[@]}]="$rel"
+          saved_blobs[${#saved_blobs[@]}]="$(vault_blob "$rel")"
           n_changed=$((n_changed + 1))
           base_record "$rel"
           step "$rel  ${C_DIM}changed → vault (replaced the other machine's version)${C_RST}"
@@ -266,6 +287,7 @@ cmd_save() {
       new|changed)
         if encrypt_file "$PROJECT_DIR/$rel" "$base/$rel.age"; then
           saved[${#saved[@]}]="$rel"
+          saved_blobs[${#saved_blobs[@]}]="$(vault_blob "$rel")"
           base_record "$rel"
           if [[ "$st" == new ]]; then
             n_new=$((n_new + 1))
@@ -314,6 +336,21 @@ cmd_save() {
 
   if [[ $failed -gt 0 ]]; then
     err "$(plural "$failed" file) could not be encrypted: the vault is NOT complete"
+    return 1
+  fi
+  # Another machine may have pushed the same file between our fetch and our
+  # push: the retry merged it, and its version may have won.
+  local i lost=()
+  i=0
+  while [[ $i -lt ${#saved[@]} ]]; do
+    if [[ "$(vault_blob "${saved[$i]}")" != "${saved_blobs[$i]}" ]]; then
+      lost[${#lost[@]}]="${saved[$i]}"
+    fi
+    i=$((i + 1))
+  done
+  if [[ ${#lost[@]} -gt 0 ]]; then
+    err "$(short_list 3 "${lost[@]}"): another machine saved a different version at the same moment and the vault kept it (see above); yours stays in git history"
+    say "  run 'ev save' again to put this folder's version back (you will be asked)"
     return 1
   fi
   local total=$((n_new + n_changed))
@@ -514,9 +551,17 @@ cmd_restore() {
             base_record "$rel"
             backed=$((backed + 1))
             if [[ "$st" == stale ]]; then
-              step "$rel  ${C_DIM}vault → project (newer version from another machine, backup kept)${C_RST}"
+              step "$rel  ${C_DIM}vault → project (newer version saved elsewhere, backup kept)${C_RST}"
             else
               step "$rel  ${C_DIM}vault → project (replaced, backup kept)${C_RST}"
+            fi
+            # --quiet still says when a local file was replaced (one line).
+            if [[ "${QUIET:-0}" == 1 ]]; then
+              if [[ "$st" == stale ]]; then
+                warn "$rel updated to the newer vault version (backup: $(tildify "$BACKUP_DIR"))"
+              else
+                warn "$rel differed from the vault: replaced by the vault version (backup: $(tildify "$BACKUP_DIR"))"
+              fi
             fi
           else
             failed=$((failed + 1))
@@ -582,8 +627,8 @@ status_report() {
     case "$st" in
       same) line="${C_ACC}✓${C_RST} $(printf "%-${w}s" "$rel")  in sync" ;;
       changed) line="${C_WARN}~${C_RST} $(printf "%-${w}s" "$rel")  changed here: $(key_diff_line "$rel")" ;;
-      stale) line="${C_WARN}↓${C_RST} $(printf "%-${w}s" "$rel")  newer in the vault ($(vault_file_commit "$rel"), another machine), not edited here: ev restore" ;;
-      conflict) line="${C_ERR}!${C_RST} $(printf "%-${w}s" "$rel")  changed here AND in the vault ($(vault_file_commit "$rel"), another machine): $(key_diff_line "$rel")" ;;
+      stale) line="${C_WARN}↓${C_RST} $(printf "%-${w}s" "$rel")  newer in the vault ($(vault_file_commit "$rel"), saved from another machine or folder); this copy is unchanged since its last save/restore: ev restore" ;;
+      conflict) line="${C_ERR}!${C_RST} $(printf "%-${w}s" "$rel")  changed here AND in the vault ($(vault_file_commit "$rel"), saved from another machine or folder): $(key_diff_line "$rel")" ;;
       new) line="${C_WARN}+${C_RST} $(printf "%-${w}s" "$rel")  only in project (not saved yet)" ;;
       vaultonly) line="${C_WARN}-${C_RST} $(printf "%-${w}s" "$rel")  only in vault (missing here)" ;;
       tracked) line="${C_DIM}· $(printf "%-${w}s" "$rel")  tracked by git, envora skips it${C_RST}" ;;
