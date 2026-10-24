@@ -136,6 +136,29 @@ warn_if_local_differs() {
   return 0
 }
 
+# Variable names a platform accepts. Anything else (e.g. a line "--scope=x"
+# in a dotenv file) is never passed to a CLI: it would be read as an option.
+valid_var_name() {
+  local re='^[A-Za-z_][A-Za-z0-9_]*$'
+  [[ "$1" =~ $re ]]
+}
+
+# split_var_names "keys (one per line)" -> sets VALID_KEYS / BAD_KEYS
+VALID_KEYS="" BAD_KEYS=()
+split_var_names() {
+  local k
+  VALID_KEYS="" BAD_KEYS=()
+  while IFS= read -r k; do
+    [[ -z "$k" ]] && continue
+    if valid_var_name "$k"; then
+      VALID_KEYS="$VALID_KEYS$k"$'\n'
+    else
+      BAD_KEYS[${#BAD_KEYS[@]}]="$k"
+    fi
+  done <<<"$1"
+  VALID_KEYS="${VALID_KEYS%$'\n'}"
+}
+
 # Show the last lines of a tool's output, indented.
 show_tool_output() {
   if [[ "${QUIET:-0}" == 1 ]]; then
@@ -184,10 +207,16 @@ parse_provider_args() {
       --file=*) P_FILE="${1#--file=}" ;;
       --dry-run|-n) P_DRY=1 ;;
       --update-shared) P_SHARED=1 ;;
+      --as) [[ $# -ge 2 ]] || { err "--as needs a name"; return 1; }; ARG_AS="$2"; shift ;;
+      --as=*) ARG_AS="${1#--as=}" ;;
+      --force) ARG_FORCE=1 ;;
       *) err "unknown option for $cmd: $1 (see: ev help $cmd)"; return 1 ;;
     esac
     shift
   done
+  if [[ -n "${ARG_AS:-}" ]]; then
+    require_valid_name "$ARG_AS" || return 1
+  fi
   if [[ -n "$P_ENV" ]]; then
     local re='^[A-Za-z0-9._-]+$'
     [[ "$P_ENV" =~ $re ]] || { err "invalid environment name: $P_ENV"; return 1; }

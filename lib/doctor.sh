@@ -92,6 +92,8 @@ cmd_doctor() {
       elif [[ $key_ok == 1 ]]; then
         doc_bad "your key does NOT match the vault (.recipient)" "ev init --import-key (the key was rotated elsewhere, or this machine made its own)"
       fi
+    elif [[ $key_ok == 1 ]] && ! key_matches_vault; then
+      doc_bad "your key cannot decrypt the vault files (e.g. $VAULT_SAMPLE)" "ev init --import-key (paste the key this vault was made with)"
     else
       doc_info "no .recipient yet (written by the next save)"
     fi
@@ -137,7 +139,7 @@ cmd_doctor() {
     [[ $n -gt 0 ]] && doc_ok "$(plural "$n" "env file") handled by envora"
     [[ $n -eq 0 ]] && doc_info "no env files in this project"
     if vault_exists && [[ $key_ok == 1 && -d "$ENVORA_VAULT/$PROJECT_NAME" ]]; then
-      check_origin "$PROJECT_NAME" >/dev/null 2>&1 || doc_bad "the vault entry '$PROJECT_NAME' belongs to another repository" "ev save --as <other-name>"
+      check_origin "$PROJECT_NAME" >/dev/null 2>&1 || doc_bad "the vault entry '$PROJECT_NAME' belongs to another repository" "ev save --as <other-name> (or --force if it is the same repo, renamed or moved)"
       local legacy
       for legacy in .env.development .env.preview .env.production; do
         [[ -f "$ENVORA_VAULT/$PROJECT_NAME/$legacy.age" ]] || continue

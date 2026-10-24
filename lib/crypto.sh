@@ -19,16 +19,16 @@ pubkey_of() {
 require_key() {
   [[ -n "$KEY_PUB" ]] && return 0
   if ! key_exists; then
-    err "no envora key at $ENVORA_KEY"
+    err "no envora key at $(tildify "$ENVORA_KEY")"
     say "  run 'ev init' to import your existing key or create one"
     return 1
   fi
   if [[ ! -r "$ENVORA_KEY" ]]; then
-    err "the key at $ENVORA_KEY is not readable"
+    err "the key at $(tildify "$ENVORA_KEY") is not readable"
     return 1
   fi
   KEY_PUB="$(pubkey_of "$ENVORA_KEY")" || {
-    err "$ENVORA_KEY is not a valid age key"
+    err "$(tildify "$ENVORA_KEY") is not a valid age key"
     return 1
   }
 }
@@ -39,10 +39,35 @@ vault_recipient() {
   head -n 1 "$f" | tr -d '[:space:]'
 }
 
+# key_matches_vault -> 0 when the vault is encrypted for this key (or empty).
+# The vault's .recipient says which key it uses; a vault saved by envora 0.x
+# has none, so one of its files is decrypted instead.
+# Sets VAULT_EXPECTED (public key from .recipient) or VAULT_SAMPLE (a vault
+# file this key cannot decrypt).
+VAULT_EXPECTED="" VAULT_SAMPLE=""
+key_matches_vault() {
+  local rec sample
+  VAULT_EXPECTED="" VAULT_SAMPLE=""
+  if rec="$(vault_recipient)" && [[ -n "$rec" ]]; then
+    VAULT_EXPECTED="$rec"
+    [[ "$rec" == "$KEY_PUB" ]]
+    return
+  fi
+  sample="$(find "$ENVORA_VAULT" -name '*.age' -type f ! -path '*/.git/*' 2>/dev/null | LC_ALL=C sort | head -n 1)"
+  if [[ -n "$sample" ]] && ! decrypts_with_key "$sample"; then
+    VAULT_SAMPLE="${sample#"$ENVORA_VAULT"/}"
+    return 1
+  fi
+  return 0
+}
+
 recipient_mismatch_message() {
-  local expected="$1"
-  err "this vault is encrypted for a different key than yours"
-  say "  vault expects: $(printf '%.24s' "$expected")..."
+  if [[ -n "$VAULT_EXPECTED" ]]; then
+    err "this vault is encrypted for a different key than yours"
+    say "  vault expects: $(printf '%.24s' "$VAULT_EXPECTED")..."
+  else
+    err "your key cannot decrypt the files already in the vault (e.g. $VAULT_SAMPLE): it is not the key this vault was made with"
+  fi
   say "  your key:      $(printf '%.24s' "$KEY_PUB")... ($(tildify "$ENVORA_KEY"))"
   say "  Two usual causes:"
   say "    - the key was rotated on another machine (ev rotate): import the new key"
@@ -51,28 +76,19 @@ recipient_mismatch_message() {
   say "  Nothing was changed."
 }
 
-# Check the vault recipient matches the local key.
-# With "write": record it when missing (after checking existing files decrypt).
+# Check the vault is encrypted for the local key.
+# With "write": record .recipient when it is missing.
 check_recipient() {
-  local mode="${1:-read}" rec
+  local mode="${1:-read}"
   require_key || return 1
-  if rec="$(vault_recipient)" && [[ -n "$rec" ]]; then
-    if [[ "$rec" != "$KEY_PUB" ]]; then
-      recipient_mismatch_message "$rec"
-      return 1
-    fi
-    return 0
-  fi
-  [[ "$mode" == write ]] || return 0
-  # No .recipient yet (older vault): make sure existing files are ours.
-  local sample
-  sample="$(find "$ENVORA_VAULT" -name '*.age' -type f ! -path '*/.git/*' 2>/dev/null | head -n 1)"
-  if [[ -n "$sample" ]] && ! age -d -i "$ENVORA_KEY" "$sample" >/dev/null 2>&1; then
-    err "your key cannot decrypt the files already in the vault (${sample#"$ENVORA_VAULT"/})"
-    say "  This machine probably has a different key. Import your envora key with 'ev init'."
+  if ! key_matches_vault; then
+    recipient_mismatch_message
     return 1
   fi
-  printf '%s\n' "$KEY_PUB" >"$ENVORA_VAULT/.recipient"
+  if [[ "$mode" == write && -z "$VAULT_EXPECTED" ]]; then
+    printf '%s\n' "$KEY_PUB" >"$ENVORA_VAULT/.recipient"
+  fi
+  return 0
 }
 
 # decrypt_to_stdout file.age

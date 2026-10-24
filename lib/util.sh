@@ -26,13 +26,33 @@ ev_cleanup() {
   return 0
 }
 
+# Temp dirs of earlier runs that were killed (SIGKILL skips every trap, and
+# fzf kills its previews that way): removed when their process is gone.
+ev_sweep_tmp() {
+  local d pid
+  for d in "${TMPDIR:-/tmp}"/envora.??????; do
+    [[ -d "$d" && -O "$d" ]] || continue
+    pid="$(head -n 1 "$d/.pid" 2>/dev/null || true)"
+    case "$pid" in
+      ''|*[!0-9]*)
+        # no pid yet: only an old one is an orphan
+        [[ -n "$(find "$d" -maxdepth 0 -mmin +60 2>/dev/null)" ]] && rm -rf -- "$d" 2>/dev/null
+        ;;
+      *) kill -0 "$pid" 2>/dev/null || rm -rf -- "$d" 2>/dev/null ;;
+    esac
+  done
+  return 0
+}
+
 # Every run gets one private temp dir, removed on exit or signal.
 ev_setup_tmp() {
   umask 077
+  ev_sweep_tmp
   TMP_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/envora.XXXXXX")" || {
     printf 'ev: error: cannot create a temp dir\n' >&2
     exit 1
   }
+  printf '%s\n' "$$" >"$TMP_ROOT/.pid"
   trap 'ev_cleanup' EXIT
   trap 'ev_cleanup; trap - EXIT; exit 130' INT
   trap 'ev_cleanup; trap - EXIT; exit 143' TERM
@@ -61,17 +81,17 @@ tmpfile() {
   mktemp "$TMP_ROOT/${1:-f}.XXXXXX"
 }
 
-# Project names: ^[A-Za-z0-9._-]+$, not starting with "."
+# Project names: ^[A-Za-z0-9._-]+$, not starting with "." or "-"
 valid_name() {
   local re='^[A-Za-z0-9._-]+$'
   [[ "$1" =~ $re ]] || return 1
-  [[ "$1" != .* ]] || return 1
+  [[ "$1" != .* && "$1" != -* ]] || return 1
   return 0
 }
 
 require_valid_name() {
   valid_name "$1" && return 0
-  err "invalid project name '$1': use letters, digits, '.', '_' or '-', not starting with '.'"
+  err "invalid project name '$1': use letters, digits, '.', '_' or '-', not starting with '.' or '-'"
   return 1
 }
 
@@ -139,10 +159,10 @@ now_stamp() {
 # --- dotenv ------------------------------------------------------------------
 #
 # dotenv_json TAG < file  ->  one JSON object per variable: {"s":TAG,"k":..,"v":..}
-# Same rules as the dotenv package that wrangler and Next.js use, so what envora
-# sends to a platform is what `wrangler dev` / `next dev` read locally:
-#   - optional "export ", KEY = value, comments start with # (even mid-value
-#     when the value is not quoted)
+# Same rules as the dotenv package that wrangler uses, so what envora sends to
+# a platform is what `wrangler dev` reads locally ($VAR is never expanded):
+#   - optional "export ", KEY = value or KEY: value, comments start with #
+#     (even mid-value when the value is not quoted)
 #   - '...' and `...` are literal; "..." only turns \n and \r into newlines
 #   - a quoted value may span lines when its closing quote ends a line
 #   - an unclosed quote is a literal value on its own line (it never swallows
@@ -210,9 +230,10 @@ END {
     line = L[i]
     sub(/^[ \t]+/, "", line)
     sub(/^export[ \t]+/, "", line)
-    if (!match(line, /^[A-Za-z0-9_.-]+[ \t]*=/)) { i++; continue }
+    if (!match(line, /^[A-Za-z0-9_.-]+[ \t]*=/) && !match(line, /^[A-Za-z0-9_.-]+:[ \t]/)) { i++; continue }
     key = substr(line, 1, RLENGTH)
     sub(/[ \t]*=$/, "", key)
+    sub(/:[ \t]$/, "", key)
     rest = substr(line, RLENGTH + 1)
     sub(/^[ \t]+/, "", rest)
     off = length(L[i]) - length(rest)

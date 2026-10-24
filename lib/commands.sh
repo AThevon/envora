@@ -318,9 +318,7 @@ cmd_save() {
   local n_files commit_rc=1
   n_files="$(vault_project_files "$PROJECT_NAME" | grep -c . || true)"
   if [[ "$n_files" -gt 0 ]]; then
-    if [[ -n "$PROJECT_ORIGIN" && ! -f "$base/.origin" ]]; then
-      printf '%s\n' "$PROJECT_ORIGIN" >"$base/.origin"
-    fi
+    save_origin_file
     vault_gitattributes
     local msg="save: $PROJECT_NAME"
     [[ ${#saved[@]} -gt 0 ]] && msg="save: $PROJECT_NAME ($(short_list 5 "${saved[@]}"))"
@@ -378,6 +376,24 @@ cmd_save() {
     return 1
   fi
   return "$push_rc"
+}
+
+# Record (or fix) vault/<project>/.origin: written when missing, replaced on
+# --force when the project now has another origin, and cleaned when an older
+# envora stored credentials in it.
+save_origin_file() {
+  local f="$ENVORA_VAULT/$PROJECT_NAME/.origin" cur=""
+  [[ -f "$f" ]] && cur="$(head -n 1 "$f" 2>/dev/null || true)"
+  if [[ -n "$PROJECT_ORIGIN" ]]; then
+    if [[ -z "$cur" ]] || { [[ "${ARG_FORCE:-0}" == 1 ]] && ! same_origin "$cur" "$PROJECT_ORIGIN"; }; then
+      [[ -n "$cur" ]] && say "${C_DIM}origin of $PROJECT_NAME in the vault: now $PROJECT_ORIGIN (was $(sanitize_origin "$cur"))${C_RST}"
+      printf '%s\n' "$PROJECT_ORIGIN" >"$f"
+      return 0
+    fi
+  fi
+  if [[ -n "$cur" && "$cur" != "$(sanitize_origin "$cur")" ]]; then
+    printf '%s\n' "$(sanitize_origin "$cur")" >"$f"
+  fi
 }
 
 # For files changed both here and in the vault, ask what to do (interactive)
@@ -650,8 +666,10 @@ status_report() {
 
 # Vercel snapshots (ev import vercel): never restored, shown here instead,
 # compared with the matching project file (.env.<env>) when there is one.
+# The decrypted snapshot only lives in a variable and in pipes (a killed
+# preview leaves nothing behind).
 status_snapshots() {
-  local snaps rel env dir local_rel n unknown cmp extra
+  local snaps rel env dir local_rel n unknown cmp extra snap sens line diff
   snaps="$(vault_snapshot_files "$PROJECT_NAME")"
   [[ -n "$snaps" ]] || return 0
   out ""
@@ -664,29 +682,43 @@ status_snapshots() {
     case "$dir" in */*) dir="${dir%/*}" ;; *) dir="" ;; esac
     local_rel=".env.$env"
     [[ -n "$dir" ]] && local_rel="$dir/.env.$env"
-    if ! decrypt_stream "$ENVORA_VAULT/$PROJECT_NAME/$rel.age" >"$TMP_ROOT/snap.plain" 2>/dev/null; then
+    if ! snap="$(decrypt_stream "$ENVORA_VAULT/$PROJECT_NAME/$rel.age" 2>/dev/null; printf x)"; then
       out "  ▲ $rel  ${C_ERR}cannot decrypt${C_RST}"
       continue
     fi
-    n="$(dotenv_keys <"$TMP_ROOT/snap.plain" | grep -c . || true)"
-    unknown="$(grep -c '^[A-Za-z_][A-Za-z0-9_.-]*="\[SENSITIVE\]"$' "$TMP_ROOT/snap.plain" || true)"
+    snap="${snap%x}"
+    n="$(printf '%s' "$snap" | dotenv_keys | grep -c . || true)"
+    # Secret variables: the name is known, the value is not ([SENSITIVE]).
+    sens="$(printf '%s' "$snap" | sed -n 's/^\([A-Za-z_][A-Za-z0-9_.-]*\)="\[SENSITIVE\]"$/\1/p')"
+    unknown="$(printf '%s' "$sens" | grep -c . || true)"
     extra=""
     [[ "$unknown" -gt 0 ]] && extra=", $unknown write-only (value unknown)"
     cmp=""
     if [[ -f "$PROJECT_DIR/$local_rel" ]]; then
-      cmp="$({ dotenv_json a <"$PROJECT_DIR/$local_rel"; grep -v '="\[SENSITIVE\]"$' "$TMP_ROOT/snap.plain" | dotenv_json b; } | dotenv_diff_stream | key_diff_summary "$local_rel" "Vercel")"
+      diff="$({ dotenv_json a <"$PROJECT_DIR/$local_rel"; printf '%s' "$snap" | dotenv_json b; } | dotenv_diff_stream)"
+      # A Secret's value cannot be compared: not a difference.
+      if [[ -n "$sens" ]]; then
+        diff="$(printf '%s\n' "$diff" | while IFS= read -r line; do
+          if [[ "$line" == "~ "* ]] && grep -Fxq -- "${line#\~ }" <<<"$sens"; then
+            continue
+          fi
+          printf '%s\n' "$line"
+        done)"
+      fi
+      cmp="$(printf '%s\n' "$diff" | key_diff_summary "$local_rel" "Vercel")"
       [[ "$cmp" == "same keys and values, formatting differs" ]] && cmp="same values as $local_rel"
+      [[ "$unknown" -gt 0 ]] && cmp="$cmp (Secrets not compared)"
       cmp=" · $cmp"
     fi
     out "  ▲ $rel  ${C_DIM}$(plural "$n" var)$extra$cmp${C_RST}"
     if [[ "${ARG_VALUES:-0}" == 1 ]]; then
       if [[ -f "$PROJECT_DIR/$local_rel" ]]; then
-        diff -u --label "vault/$rel" --label "project/$local_rel" "$TMP_ROOT/snap.plain" "$PROJECT_DIR/$local_rel" | sed 's/^/      /' || true
+        diff -u --label "vault/$rel" --label "project/$local_rel" <(printf '%s' "$snap") "$PROJECT_DIR/$local_rel" | sed 's/^/      /' || true
       else
-        sed 's/^/      /' "$TMP_ROOT/snap.plain"
+        printf '%s' "$snap" | sed 's/^/      /'
       fi
     fi
-    rm -f "$TMP_ROOT/snap.plain"
+    snap=""
   done <<<"$snaps"
 }
 

@@ -25,7 +25,7 @@ install_key_from_text() {
     bak="$ENVORA_KEY.bak-$(now_stamp)"
     while [[ -e "$bak" ]]; do n=$((n + 1)); bak="$ENVORA_KEY.bak-$(now_stamp)-$n"; done
     if ! cp -p "$ENVORA_KEY" "$bak" || ! chmod 600 "$bak"; then
-      err "cannot keep the current key as $bak: nothing changed"
+      err "cannot keep the current key as $(tildify "$bak"): nothing changed"
       return 1
     fi
     say "${C_DIM}the previous key is kept at $(tildify "$bak")${C_RST}"
@@ -53,7 +53,8 @@ init_import_key() {
   say "Paste your envora key: the AGE-SECRET-KEY-... line (pasting the whole key file works too)."
   while [[ $try -le 3 ]]; do
     if has gum; then
-      text="$(gum input --password --placeholder "AGE-SECRET-KEY-..." --width 80 </dev/tty)" || return 1
+      # No length limit: a post-quantum key file (ev rotate --pq) is ~2 KB.
+      text="$(gum input --password --char-limit 0 --placeholder "AGE-SECRET-KEY-..." --width 80 </dev/tty)" || return 1
     else
       printf 'key: ' >&2
       IFS= read -rs text </dev/tty || return 1
@@ -84,7 +85,7 @@ init_generate_key() {
   say ""
   say "Without it, nobody (not even you) can decrypt the vault on another machine."
   if is_interactive && ! confirm "I saved the key in my password manager"; then
-    warn "keep it safe: it is in $ENVORA_KEY"
+    warn "keep it safe: it is in $(tildify "$ENVORA_KEY")"
   fi
   return 0
 }
@@ -197,7 +198,7 @@ run_init() {
           *) key_mode=generate ;;
         esac
       else
-        err "no key at $ENVORA_KEY: use --import-key (key on stdin) or --generate-key"
+        err "no key at $(tildify "$ENVORA_KEY"): use --import-key (key on stdin) or --generate-key"
         return 1
       fi
     fi
@@ -221,7 +222,7 @@ run_init() {
       esac
     fi
   elif [[ -e "$ENVORA_VAULT" && -n "$(ls -A "$ENVORA_VAULT" 2>/dev/null)" ]]; then
-    err "$ENVORA_VAULT exists but is not a git repo: move it away or set another path (ev config set vault ...)"
+    err "$(tildify "$ENVORA_VAULT") exists but is not a git repo: move it away or set another path (ev config set vault ...)"
     return 1
   elif [[ -n "$create" ]]; then
     init_create "$create" || return 1
@@ -230,14 +231,14 @@ run_init() {
   elif is_interactive; then
     init_pick_repo || return 1
   else
-    err "no vault at $ENVORA_VAULT: use --repo user/name (clone) or --create name"
+    err "no vault at $(tildify "$ENVORA_VAULT"): use --repo user/name (clone) or --create name"
     return 1
   fi
 
   # The vault must be encrypted for this key.
-  local rec c
-  while rec="$(vault_recipient)" && [[ -n "$rec" && "$rec" != "$KEY_PUB" ]]; do
-    recipient_mismatch_message "$rec"
+  local c
+  while ! key_matches_vault; do
+    recipient_mismatch_message
     is_interactive || return 1
     c="$(choose "What now?" \
       "Paste the right key now (the current one is kept as .bak)" \

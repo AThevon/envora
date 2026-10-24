@@ -29,7 +29,8 @@ expand_path() {
 
 # Read a value the way a shell would read a word: '...' literal, "..." with
 # \" \\ \$ \` escapes, backslash escapes outside quotes, pieces glued
-# together. Returns 1 for what it does not understand ($'...', open quote).
+# together, a " # comment" after the value ignored. Nothing is ever executed.
+# Returns 1 for what it does not understand ($'...', open quote).
 config_unquote() {
   local v="$1" res="" c nxt i=0 n state=none
   case "$v" in \$\'*) return 1 ;; esac
@@ -38,7 +39,16 @@ config_unquote() {
     c="${v:$i:1}"
     case "$state" in
       none)
-        if [[ "$c" == "'" ]]; then
+        if [[ "$c" == " " || "$c" == $'\t' ]]; then
+          # Outside quotes, blanks before a # start a comment (as in a shell);
+          # trailing blanks are dropped; other blanks are kept as written.
+          local rest="${v:$i}"
+          rest="${rest#"${rest%%[![:space:]]*}"}"
+          if [[ -z "$rest" || "$rest" == \#* ]]; then
+            break
+          fi
+          res="$res$c"
+        elif [[ "$c" == "'" ]]; then
           state=single
         elif [[ "$c" == '"' ]]; then
           state=double
@@ -246,7 +256,8 @@ cmd_config() {
       ;;
     get)
       local var
-      var="$(config_var_name "${2:-}")" || { err "unknown setting: ${2:-}"; return 1; }
+      [[ -n "${2:-}" ]] || { err "usage: ev config get <setting>  (vault, key, projects, repo, vercel-cmd, wrangler-cmd)"; return 1; }
+      var="$(config_var_name "$2")" || { err "unknown setting: $2 (vault, key, projects, repo, vercel-cmd, wrangler-cmd)"; return 1; }
       eval "out \"\${$var:-}\""
       ;;
     set)

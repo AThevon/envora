@@ -27,7 +27,42 @@ repo_name_from_url() {
   printf '%s' "$u"
 }
 
-# Comparable form of an origin URL: host/path, lowercase host, no .git
+# Credentials never go into the vault or on screen:
+#   https://user:token@github.com/me/x -> https://github.com/me/x
+#   ssh://git:pw@host/x -> ssh://git@host/x   (git@host:me/x is kept as is)
+sanitize_origin() {
+  local u="$1" scheme rest authority path user host
+  case "$u" in
+    *://*) ;;
+    *) printf '%s' "$u"; return 0 ;;
+  esac
+  scheme="${u%%://*}"
+  rest="${u#*://}"
+  authority="${rest%%/*}"
+  path="${rest#"$authority"}"
+  case "$authority" in
+    *@*) ;;
+    *) printf '%s' "$u"; return 0 ;;
+  esac
+  host="${authority##*@}"
+  user="${authority%@*}"
+  user="${user%%:*}"
+  case "$scheme" in
+    http|https|HTTP|HTTPS) user="" ;;
+  esac
+  printf '%s://%s%s%s' "$scheme" "${user:+$user@}" "$host" "$path"
+}
+
+# Origin URL recorded for a vault entry (credentials removed), or nothing.
+entry_origin() {
+  local f="$ENVORA_VAULT/$1/.origin" o=""
+  [[ -f "$f" ]] || return 0
+  o="$(head -n 1 "$f" 2>/dev/null || true)"
+  sanitize_origin "$o"
+}
+
+# Comparable form of an origin URL: host/path, lowercase host, no .git.
+# GitHub, GitLab and Bitbucket ignore case in owner/repo: lowercased too.
 normalize_origin() {
   local u="$1" host path
   while [[ "$u" == */ ]]; do u="${u%/}"; done
@@ -51,7 +86,16 @@ normalize_origin() {
       ;;
   esac
   host="$(printf '%s' "$host" | tr '[:upper:]' '[:lower:]')"
+  case "$host" in
+    github.com|gitlab.com|bitbucket.org|www.github.com)
+      path="$(printf '%s' "$path" | tr '[:upper:]' '[:lower:]')"
+      ;;
+  esac
   printf '%s/%s' "$host" "$path"
+}
+
+same_origin() {
+  [[ "$(normalize_origin "$1")" == "$(normalize_origin "$2")" ]]
 }
 
 # Name of the main worktree directory (worktrees share it).
@@ -90,13 +134,17 @@ vault_name_for_dir() {
   if [[ ! -d "$ENVORA_VAULT/$name" ]]; then
     legacy="$(main_worktree_name "$dir" 2>/dev/null || basename "$dir")"
     if [[ "$legacy" != "$name" && -d "$ENVORA_VAULT/$legacy" ]] && valid_name "$legacy"; then
-      f="$ENVORA_VAULT/$legacy/.origin"
-      saved="$(head -n 1 "$f" 2>/dev/null || true)"
-      if [[ -z "$saved" || -z "$PROJECT_ORIGIN" ]] ||
-        [[ "$(normalize_origin "$saved")" == "$(normalize_origin "$PROJECT_ORIGIN")" ]]; then
+      saved="$(entry_origin "$legacy")"
+      if [[ -z "$saved" || -z "$PROJECT_ORIGIN" ]] || same_origin "$saved" "$PROJECT_ORIGIN"; then
         name="$legacy"
       fi
     fi
+  fi
+  # Same entry spelled with another case (GitHub ignores case; macOS too).
+  f="$(vault_projects)"
+  if ! grep -Fxq -- "$name" <<<"$f"; then
+    f="$(awk -v n="$name" 'tolower($0) == tolower(n) { print; exit }' <<<"$f")"
+    [[ -n "$f" ]] && name="$f"
   fi
   printf '%s' "$name"
 }
@@ -132,7 +180,7 @@ set_project_dir() {
   if top="$(git_toplevel "$d")" && [[ -n "$top" ]]; then
     PROJECT_DIR="$(abs_dir "$top")"
     PROJECT_IS_GIT=1
-    PROJECT_ORIGIN="$(origin_url_of "$PROJECT_DIR" || true)"
+    PROJECT_ORIGIN="$(sanitize_origin "$(origin_url_of "$PROJECT_DIR" || true)")"
   else
     PROJECT_DIR="$d"
     PROJECT_IS_GIT=0
@@ -294,27 +342,104 @@ scan_unreached() {
     done | LC_ALL=C sort >"$TMP_ROOT/scan.unreached"
 }
 
+# " -C <dir>" when the project is not the one around the current folder, so
+# a suggested command works when pasted as is.
+project_hint_flags() {
+  local cur
+  cur="$(git_toplevel "$PWD" 2>/dev/null || true)"
+  [[ -n "$cur" ]] && cur="$(abs_dir "$cur" || printf '%s' "$cur")"
+  [[ "$cur" == "$PROJECT_DIR" ]] && return 0
+  printf ' -C %s' "$(tildify "$PROJECT_DIR")"
+}
+
 # Refuse when the vault entry belongs to another repository, or when it has a
-# known origin and this folder cannot show one. An explicit --as skips it.
+# known origin and this folder cannot show one. --as only picks the entry: it
+# does not skip this check. --force does (and save then records the new origin,
+# e.g. after the repo was renamed or moved to an organization).
 # check_origin NAME [save|restore|status|export...]
 check_origin() {
-  local name="$1" cmd="${2:-save}" f="$ENVORA_VAULT/$1/.origin" saved
-  [[ -f "$f" ]] || return 0
-  [[ -n "${ARG_AS:-}" ]] && return 0
-  saved="$(head -n 1 "$f")"
+  local name="$1" cmd="${2:-save}" saved report=err flags
+  saved="$(entry_origin "$name")"
   [[ -z "$saved" ]] && return 0
-  if [[ -z "$PROJECT_ORIGIN" ]]; then
-    err "the vault entry '$name' belongs to $saved, and $(tildify "$PROJECT_DIR") has no git origin to show it is that project"
-  elif [[ "$(normalize_origin "$saved")" != "$(normalize_origin "$PROJECT_ORIGIN")" ]]; then
-    err "the vault entry '$name' belongs to another repository"
-    say "  vault entry:  $saved"
-    say "  this project: $PROJECT_ORIGIN"
-  else
+  if [[ -n "$PROJECT_ORIGIN" ]] && same_origin "$saved" "$PROJECT_ORIGIN"; then
     return 0
   fi
+  if [[ "${ARG_FORCE:-0}" == 1 ]]; then
+    say "${C_DIM}--force: $(tildify "$PROJECT_DIR") is used as the vault entry '$name' ($saved)${C_RST}"
+    return 0
+  fi
+  [[ "$cmd" == status ]] && report=warn
+  if [[ -z "$PROJECT_ORIGIN" ]]; then
+    "$report" "the vault entry '$name' belongs to $saved, and $(tildify "$PROJECT_DIR") has no git origin to show it is that project"
+  else
+    "$report" "the vault entry '$name' belongs to another repository"
+    say "  vault entry:  $saved"
+    say "  this project: $PROJECT_ORIGIN"
+  fi
+  flags="$(project_hint_flags)"
   case "$cmd" in
-    save) say "  save it under another name: ev save --as <other-name>  (or --as $name if it really is the same project)" ;;
-    *) say "  if it really is the same project: ev $cmd --as $name" ;;
+    save)
+      say "  save it under another name:  ev save$flags --as <other-name>"
+      say "  same project (repo renamed or moved): ev save$flags --as $name --force  (records the new origin)"
+      ;;
+    status) ;;
+    *) say "  if it really is the same project: ev $cmd$flags --as $name --force" ;;
   esac
   return 1
+}
+
+# --- where vault entries live on this machine ---------------------------------
+
+# Remember the folder an entry was last saved or restored from.
+record_project_dir() {
+  local f="$ENVORA_STATE/dirs/$PROJECT_NAME"
+  mkdir -p "$(dirname "$f")" 2>/dev/null || return 0
+  printf '%s\n' "$PROJECT_DIR" >"$f" 2>/dev/null || true
+}
+
+# Vault entry name of a project folder, from its own git origin.
+entry_name_of_dir() {
+  local PROJECT_ORIGIN
+  PROJECT_ORIGIN="$(sanitize_origin "$(origin_url_of "$1" || true)")"
+  vault_name_for_dir "$1"
+}
+
+# "name<TAB>dir" for the folders known to hold a vault entry: the last folder
+# each entry was saved or restored from (when it still is that entry), then
+# the git repos right under ENVORA_PROJECTS. Identity comes from the git
+# origin, never from the folder name. Built once per run (the menu shares it
+# with its previews through ENVORA_LOCAL_INDEX).
+LOCAL_INDEX=""
+local_index() {
+  if [[ -n "${ENVORA_LOCAL_INDEX:-}" && -f "${ENVORA_LOCAL_INDEX:-}" ]]; then
+    LOCAL_INDEX="$ENVORA_LOCAL_INDEX"
+    return 0
+  fi
+  [[ -n "$LOCAL_INDEX" && -f "$LOCAL_INDEX" ]] && return 0
+  local_index_build
+}
+
+local_index_build() {
+  local f d n
+  LOCAL_INDEX="$TMP_ROOT/local.index"
+  : >"$LOCAL_INDEX"
+  for f in "$ENVORA_STATE"/dirs/*; do
+    [[ -f "$f" ]] || continue
+    d="$(head -n 1 "$f" 2>/dev/null || true)"
+    [[ -n "$d" && -d "$d" ]] || continue
+    n="$(entry_name_of_dir "$d")"
+    [[ "$n" == "$(basename "$f")" ]] && printf '%s\t%s\n' "$n" "$d"
+  done >>"$LOCAL_INDEX"
+  for d in "$ENVORA_PROJECTS"/*/; do
+    d="${d%/}"
+    [[ -e "$d/.git" ]] || continue
+    d="$(abs_dir "$d" || printf '%s' "$d")"
+    printf '%s\t%s\n' "$(entry_name_of_dir "$d")" "$d"
+  done >>"$LOCAL_INDEX"
+}
+
+# local_dir_of NAME -> the folder holding that entry here, or nothing
+local_dir_of() {
+  local_index
+  awk -F '\t' -v n="$1" '$1 == n { print $2; exit }' "$LOCAL_INDEX" 2>/dev/null || true
 }

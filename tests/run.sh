@@ -402,6 +402,8 @@ t_name_validation() {
   expect_rc 1 save --as ../escape
   assert_contains "$OUT" "invalid project name"
   expect_rc 1 save --as .hidden
+  expect_rc 1 save --as -rf
+  assert_no_file "$ENVORA_VAULT/-rf"
   expect_rc 1 save --as 'a b'
   expect_rc 1 restore ..
   expect_rc 1 forget ..
@@ -559,9 +561,30 @@ t_restore_and_save_check_origin() {
   printf 'MY_SECRET=other\n' >"$bare/.env"
   expect_rc 1 save -C "$bare" --yes
   assert_eq "$(age -d -i "$ENVORA_KEY" "$ENVORA_VAULT/app/.env.age")" "MY_SECRET=1"
-  # an explicit --as says "this is that project"
-  expect_rc 0 restore -C "$fork" --as app --yes
+  # --as only names the entry: it does not skip the origin check
+  expect_rc 1 restore -C "$fork" --as app --yes
+  assert_contains "$OUT" "ev restore -C ~/elsewhere/app --as app --force"
+  assert_no_file "$fork/.env"
+  # another repo cannot overwrite an entry by typing its name
+  local web
+  web="$(mkproject web "git@github.com:me/web.git")"
+  printf 'WEB=1\n' >"$web/.env"
+  expect_rc 1 save -C "$web" --as app --yes
+  assert_eq "$(age -d -i "$ENVORA_KEY" "$ENVORA_VAULT/app/.env.age")" "MY_SECRET=1"
+  # --force says "this is that project"
+  expect_rc 0 restore -C "$fork" --as app --force --yes
   assert_file "$fork/.env"
+  # a repo moved to an organization: save --force records the new origin,
+  # then everything works without --force
+  git -C "$p" remote set-url origin "git@github.com:acme/app.git"
+  printf 'MY_SECRET=2\n' >"$p/.env"
+  cd "$p"
+  expect_rc 1 export cloudflare --dry-run
+  assert_contains "$OUT" "--as app --force"
+  expect_rc 0 save --force --yes
+  assert_eq "$(cat "$ENVORA_VAULT/app/.origin")" "git@github.com:acme/app.git"
+  expect_rc 0 status -q
+  assert_not_contains "$OUT" "another repository"
 }
 
 t_legacy_name_and_folder_guard() {
@@ -1041,6 +1064,13 @@ EOF
   assert_contains "$plain" 'PUBLIC_URL="https://example.com"'
   assert_eq "$(cat "$p/.env.production")" "LOCAL=keep" "project files untouched"
   assert_no_file "$ENVORA_VAULT/web/.env.production.age"
+  # a Secret (write-only) exists on Vercel: never reported as missing there
+  printf 'API_KEY=local\nPUBLIC_URL="https://example.com"\n' >"$p/.env.production"
+  expect_rc 0 status
+  assert_contains "$OUT" "1 write-only (value unknown)"
+  assert_not_contains "$OUT" "only in .env.production (API_KEY"
+  assert_not_contains "$OUT" "changed (API_KEY"
+  printf 'LOCAL=keep\n' >"$p/.env.production"
   # previous snapshot knows the secret value: it survives
   printf '# Created by Vercel CLI\nAPI_KEY="real-secret"\nPUBLIC_URL="https://example.com"\n' |
     age -r "$(age-keygen -y "$ENVORA_KEY")" -o "$snap"
@@ -1439,6 +1469,14 @@ EOF
   printf "ENVORA_PROJECTS=\$'/x\\ty'\n" >>"$HOME/.envorarc"
   expect_rc 0 config get projects
   assert_contains "$OUT" "cannot read ENVORA_PROJECTS"
+  # a comment after the value is not part of it
+  printf 'ENVORA_VERCEL_CMD="vercel --scope x" # my team\nENVORA_REPO=me/v   # vault repo\n' >"$HOME/.envorarc"
+  expect_rc 0 config get vercel-cmd
+  assert_eq "$OUT" "vercel --scope x"
+  expect_rc 0 config get repo
+  assert_eq "$OUT" "me/v"
+  expect_rc 1 config get
+  assert_contains "$OUT" "usage: ev config get <setting>"
 }
 
 t_dotenv_parser() {
@@ -1464,8 +1502,10 @@ t_dotenv_parser() {
     'G.H-I=dots' \
     'BROKEN="unterminated' \
     'TOKEN=after-broken' \
+    'COLON: yes' \
+    'URL:http://not-a-var' \
     'LAST="ok" # c'; } | dotenv_json x | jq -c '{(.k): .v}' | jq -Sc -s add)"
-  assert_eq "$got" '{"A":"1","B":"two","BROKEN":"\"unterminated","C":"single # not comment","D":"dq \\\"esc\\\" \n done","E":"multi\nline","F":"","FIRST":"bom","G.H-I":"dots","HASH":"abc","LAST":"ok","TAB":"x\\ty","TOKEN":"after-broken"}'
+  assert_eq "$got" '{"A":"1","B":"two","BROKEN":"\"unterminated","C":"single # not comment","COLON":"yes","D":"dq \\\"esc\\\" \n done","E":"multi\nline","F":"","FIRST":"bom","G.H-I":"dots","HASH":"abc","LAST":"ok","TAB":"x\\ty","TOKEN":"after-broken"}'
 }
 
 t_menu_previews_and_items() {
@@ -1755,6 +1795,65 @@ t_unicode_and_quote_paths_sync() {
   expect_rc 1 status -C "$pb"
   assert_contains "$OUT" "your key cannot decrypt"
   assert_not_contains "$(git -C "$ENVORA_VAULT" log --stat -1)" ".env.local.age"
+}
+
+t_origin_credentials_never_stored() {
+  local p
+  p="$(mkproject tok "https://x-access-token:ghp_SECRET123@github.com/me/tok.git")"
+  printf 'A=1\n' >"$p/.env"
+  cd "$p"
+  expect_rc 0 save -y
+  assert_eq "$(git --git-dir="$T/remote.git" show HEAD:tok/.origin)" "https://github.com/me/tok.git"
+  assert_not_contains "$OUT" "ghp_SECRET123"
+  # an entry written by an older version is cleaned on the next save
+  printf 'https://u:ghp_OLD@github.com/me/tok.git\n' >"$ENVORA_VAULT/tok/.origin"
+  git -C "$ENVORA_VAULT" commit -qam "old origin"
+  printf 'A=2\n' >"$p/.env"
+  expect_rc 0 save -y
+  assert_eq "$(cat "$ENVORA_VAULT/tok/.origin")" "https://github.com/me/tok.git"
+  # GitHub ignores case in owner/repo: same project
+  git -C "$p" remote set-url origin "https://github.com/Me/Tok.git"
+  expect_rc 0 status -q
+  assert_not_contains "$OUT" "another repository"
+}
+
+t_init_wrong_key_on_vault_without_recipient() {
+  local p
+  p="$(mkproject old)"
+  printf 'A=1\n' >"$p/.env"
+  (cd "$p" && expect_rc 0 save -q -y)
+  git -C "$ENVORA_VAULT" rm -q .recipient
+  git -C "$ENVORA_VAULT" commit -qm "a 0.x vault has no .recipient"
+  git -C "$ENVORA_VAULT" push -q
+  use_machine C
+  expect_rc 1 init --generate-key --repo "$T/remote.git"
+  assert_contains "$OUT" "your key cannot decrypt the files already in the vault"
+  assert_not_contains "$OUT" "envora is ready"
+  mkdir -p "$ENVORA_PROJECTS"
+  expect_rc 1 restore -C "$p" -y -q
+  assert_contains "$OUT" "your key cannot decrypt"
+  assert_not_contains "$OUT" "no identity matched"
+}
+
+t_killed_runs_leave_no_plaintext() {
+  local p d pid
+  p="$(mkproject app)"
+  printf 'A=1\n' >"$p/.env"
+  (cd "$p" && expect_rc 0 save -q -y)
+  # a temp dir of a run killed with SIGKILL (fzf does that to previews)
+  sh -c 'exit 0' &
+  pid=$!
+  wait "$pid"
+  d="$TMPDIR/envora.KILLED"
+  mkdir -p "$d"
+  printf '%s\n' "$pid" >"$d/.pid"
+  printf 'A=1\n' >"$d/snap.plain"
+  expect_rc 0 help
+  assert_no_file "$d"
+  # the save / restore previews never write a decrypted copy to disk
+  printf 'A=2\n' >"$p/.env"
+  ENVORA_MENU_DIR="$p" "$TEST_BASH" "$EV" _preview save >/dev/null 2>&1 </dev/null
+  assert_eq "$(grep -rl 'A=1' "$TMPDIR" 2>/dev/null | grep -v '\.age$' || true)" ""
 }
 
 # --- run ---------------------------------------------------------------------
