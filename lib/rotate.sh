@@ -1,9 +1,47 @@
 #!/usr/bin/env bash
 # lib/rotate.sh - replace the key and re-encrypt the whole vault
 #
-# Safe order: the new key and the re-encrypted files are written next to the
-# originals and verified first. Only when everything checks out is the old key
-# copied to <key>.bak-<date> and the new files moved into place.
+# Safe order:
+#   1. the new key and the re-encrypted files are written next to the
+#      originals and verified (nothing changed yet)
+#   2. the old key is copied to <key>.bak-<date>
+#   3. with INT / TERM / HUP ignored: the new key is installed FIRST, then
+#      .recipient, then the files are moved into place. At any point every file
+#      is encrypted either for the old key (kept in .bak) or for the installed
+#      new key, so no interruption can lose a secret. A failed move rolls back.
+#   4. commit, push; files another machine saved with the old key meanwhile
+#      are re-encrypted too.
+# Decryption uses the current key and every <key>.bak-*: running rotate again
+# finishes an interrupted rotation.
+
+# Re-encrypt the vault files that the current key cannot open but an old key
+# can (saved by another machine during the rotation, or left by a crash).
+# rotate_fixup -> sets FIXED and UNREADABLE (relpaths, one per line)
+rotate_fixup() {
+  local f rel
+  FIXED="" UNREADABLE=""
+  load_identities
+  while IFS= read -r f; do
+    [[ -z "$f" ]] && continue
+    decrypts_with_key "$f" && continue
+    rel="${f#"$ENVORA_VAULT"/}"
+    if age -d "${ID_ARGS[@]}" "$f" 2>/dev/null | age -r "$KEY_PUB" -o "$f.envora-new" 2>/dev/null &&
+      decrypts_with_key "$f.envora-new"; then
+      mv -f "$f.envora-new" "$f"
+      FIXED="$FIXED$rel"$'\n'
+    else
+      rm -f "$f.envora-new"
+      UNREADABLE="$UNREADABLE$rel"$'\n'
+    fi
+  done < <(find "$ENVORA_VAULT" -type f -name '*.age' ! -path '*/.git/*' | LC_ALL=C sort)
+}
+
+# Put the default signal handlers back (see ev_setup_tmp).
+rotate_restore_traps() {
+  trap 'ev_cleanup; trap - EXIT; exit 130' INT
+  trap 'ev_cleanup; trap - EXIT; exit 143' TERM
+  trap 'ev_cleanup; trap - EXIT; exit 129' HUP
+}
 
 cmd_rotate() {
   local pq=0
@@ -19,10 +57,10 @@ cmd_rotate() {
   vault_pull || return 1
   check_recipient write || return 1
 
-  local list="$TMP_ROOT/rotate.list" new_key="$ENVORA_KEY.new"
-  find "$ENVORA_VAULT" -type f -name '*.age' ! -path '*/.git/*' | LC_ALL=C sort >"$list"
+  local files="$TMP_ROOT/rotate.list" new_key="$ENVORA_KEY.new"
+  find "$ENVORA_VAULT" -type f -name '*.age' ! -path '*/.git/*' | LC_ALL=C sort >"$files"
   local total
-  total="$(grep -c . "$list" || true)"
+  total="$(grep -c . "$files" || true)"
   if [[ "$total" -eq 0 ]]; then
     warn "the vault has no encrypted files: nothing to rotate"
     return 0
@@ -31,10 +69,18 @@ cmd_rotate() {
     err "$new_key already exists (left by an interrupted rotation?): check it, delete it, then retry"
     return 1
   fi
+  vault_release
   if ! confirm "Create a new key and re-encrypt the $(plural "$total" file) of the vault?" no; then
     if is_interactive; then say "cancelled"; return 0; fi
     err "refusing to rotate without confirmation: add --yes"
     return 1
+  fi
+  if [[ "$VAULT_RELEASED" == 1 ]]; then
+    VAULT_RELEASED=0
+    vault_pull || return 1
+    check_recipient write || return 1
+    find "$ENVORA_VAULT" -type f -name '*.age' ! -path '*/.git/*' | LC_ALL=C sort >"$files"
+    total="$(grep -c . "$files" || true)"
   fi
 
   local keygen_args=()
@@ -45,19 +91,20 @@ cmd_rotate() {
     return 1
   fi
   chmod 600 "$new_key"
-  local new_pub
+  local new_pub old_pub="$KEY_PUB"
   new_pub="$(pubkey_of "$new_key")" || { err "the new key is unreadable"; return 1; }
 
-  # Re-encrypt every file to "<file>.envora-new", plaintext only in pipes.
+  # 1. Re-encrypt every file to "<file>.envora-new", plaintext only in pipes.
+  load_identities
   local f failed=0 done_n=0 a b
   while IFS= read -r f; do
     register_cleanup "$f.envora-new"
-    if ! age -d -i "$ENVORA_KEY" "$f" 2>"$TMP_ROOT/age.err" | age -r "$new_pub" -o "$f.envora-new" 2>>"$TMP_ROOT/age.err"; then
+    if ! age -d "${ID_ARGS[@]}" "$f" 2>"$TMP_ROOT/age.err" | age -r "$new_pub" -o "$f.envora-new" 2>>"$TMP_ROOT/age.err"; then
       err "cannot re-encrypt ${f#"$ENVORA_VAULT"/}: $(head -n 1 "$TMP_ROOT/age.err")"
       failed=$((failed + 1))
       continue
     fi
-    a="$(age -d -i "$ENVORA_KEY" "$f" 2>/dev/null | cksum)" || a="old-failed"
+    a="$(age -d "${ID_ARGS[@]}" "$f" 2>/dev/null | cksum)" || a="old-failed"
     b="$(age -d -i "$new_key" "$f.envora-new" 2>/dev/null | cksum)" || b="new-failed"
     if [[ "$a" != "$b" ]]; then
       err "verification failed for ${f#"$ENVORA_VAULT"/}"
@@ -65,31 +112,88 @@ cmd_rotate() {
       continue
     fi
     done_n=$((done_n + 1))
-  done <"$list"
-
+  done <"$files"
   if [[ $failed -gt 0 ]]; then
     err "rotation aborted: $(plural "$failed" file) failed. Your key and the vault are unchanged."
     return 1
   fi
 
-  # Everything verified: switch.
-  local bak
+  # 2. Keep the old key.
+  local bak n=1
   bak="$ENVORA_KEY.bak-$(now_stamp)"
-  cp -p "$ENVORA_KEY" "$bak" || { err "cannot back up the old key to $bak; nothing changed"; return 1; }
-  chmod 600 "$bak"
-  while IFS= read -r f; do
-    mv -f "$f.envora-new" "$f"
-  done <"$list"
-  mv -f "$new_key" "$ENVORA_KEY"
-  KEY_PUB="$new_pub"
-  printf '%s\n' "$new_pub" >"$ENVORA_VAULT/.recipient"
+  while [[ -e "$bak" ]]; do n=$((n + 1)); bak="$ENVORA_KEY.bak-$(now_stamp)-$n"; done
+  if ! cp -p "$ENVORA_KEY" "$bak" || ! chmod 600 "$bak" || ! cmp -s "$ENVORA_KEY" "$bak"; then
+    err "cannot back up the old key to $bak; nothing changed"
+    return 1
+  fi
 
+  # 3. Switch, without interruption.
+  trap '' INT TERM HUP
+  if ! mv -f "$new_key" "$ENVORA_KEY"; then
+    rotate_restore_traps
+    err "cannot install the new key at $ENVORA_KEY; nothing changed (old key also kept at $bak)"
+    return 1
+  fi
+  unregister_cleanup "$new_key"
+  KEY_PUB="$new_pub"
+  local moved=() mv_failed=""
+  if ! { printf '%s\n' "$new_pub" >"$ENVORA_VAULT/.recipient.envora-new" &&
+    mv -f "$ENVORA_VAULT/.recipient.envora-new" "$ENVORA_VAULT/.recipient"; }; then
+    mv_failed=".recipient"
+  else
+    while IFS= read -r f; do
+      if mv -f "$f.envora-new" "$f" 2>"$TMP_ROOT/mv.err"; then
+        unregister_cleanup "$f.envora-new"
+        moved[${#moved[@]}]="${f#"$ENVORA_VAULT"/}"
+      else
+        mv_failed="${f#"$ENVORA_VAULT"/}"
+        break
+      fi
+    done <"$files"
+  fi
+  if [[ -n "$mv_failed" ]]; then
+    # Roll back: committed (old key) versions of the moved files, then the old key.
+    if { [[ ${#moved[@]} -eq 0 ]] || vgit checkout -q -- "${moved[@]}" 2>/dev/null; } &&
+      printf '%s\n' "$old_pub" >"$ENVORA_VAULT/.recipient" && cp -p "$bak" "$ENVORA_KEY"; then
+      KEY_PUB="$old_pub"
+      rotate_restore_traps
+      err "rotation rolled back: cannot replace $mv_failed ($(head -n 1 "$TMP_ROOT/mv.err" 2>/dev/null)). Your old key and the vault are as before."
+    else
+      rotate_restore_traps
+      err "rotation interrupted at $mv_failed: the new key is installed, some files still use the old one ($bak)"
+      say "  nothing is lost: run 'ev rotate' again to finish (it reads the old key too)"
+    fi
+    return 1
+  fi
+  rotate_restore_traps
+  load_identities # the old key is now one of the .bak files
+
+  # 4. Commit and push.
   vault_commit "rotate: re-encrypt $(plural "$done_n" file) for a new key" . >/dev/null || true
   local push_rc=0
+  SYNC_PULLED=0
   vault_push || push_rc=$?
+  if [[ "${SYNC_PULLED:-0}" -gt 0 ]]; then
+    # Another machine saved during the rotation, still with the old key.
+    rotate_fixup
+    if [[ -n "$FIXED" ]]; then
+      warn "re-encrypted $(plural "$(printf '%s' "$FIXED" | grep -c .)" file) saved meanwhile by another machine with the old key"
+      vault_commit "rotate: re-encrypt files saved during the rotation" . >/dev/null || true
+      push_rc=0
+      vault_push || push_rc=$?
+    fi
+    if [[ -n "$UNREADABLE" ]]; then
+      err "these files open with none of your keys: $(printf '%s' "$UNREADABLE" | tr '\n' ' ')"
+      push_rc=1
+    fi
+  fi
 
-  ok "key rotated: $(plural "$done_n" file) re-encrypted and verified$(push_suffix "$push_rc")"
-  say "  old key kept at $bak"
+  if [[ $push_rc == 1 ]]; then
+    partial "key rotated, but some files are not readable with it (see above)"
+  else
+    result "$push_rc" "key rotated: $(plural "$done_n" file) re-encrypted and verified$(push_suffix "$push_rc")"
+  fi
+  say "  old key kept at $(tildify "$bak") (backups made by ev restore until now need it)"
   say ""
   say "${C_BOLD}Save this new key in your password manager now (shown once):${C_RST}"
   say ""
@@ -100,6 +204,6 @@ cmd_rotate() {
   fi
   say ""
   warn "old ciphertexts remain in git history: if your key leaked, also rotate the secrets themselves at their providers"
-  say "  other machines need the new key: ev init > 'I already have an envora key'"
+  say "  other machines need the new key: ev init --import-key (paste it; their old key is kept as .bak)"
   return "$push_rc"
 }

@@ -781,6 +781,128 @@ t_rotate_failure_keeps_key() {
   assert_contains "$OUT" "add --yes"
 }
 
+# A mv wrapper first on PATH: fails or slows down on demand.
+install_mv_wrapper() {
+  mkdir -p "$T/mvbin"
+  cat >"$T/mvbin/mv" <<'STUB'
+#!/bin/bash
+for last in "$@"; do :; done
+if [[ -n "${ENVORA_TEST_MV_FAIL:-}" && "$last" == *"$ENVORA_TEST_MV_FAIL" ]]; then
+  echo "mv: rename: Operation not permitted" >&2
+  exit 1
+fi
+[[ -n "${ENVORA_TEST_MV_SLOW:-}" ]] && sleep "$ENVORA_TEST_MV_SLOW"
+for real in /bin/mv /usr/bin/mv; do [[ -x "$real" ]] && exec "$real" "$@"; done
+exit 127
+STUB
+  chmod +x "$T/mvbin/mv"
+  export PATH="$T/mvbin:$PATH"
+}
+
+# rotate_saved_vault: two projects with 4 files, all saved.
+rotate_saved_vault() {
+  local p q
+  p="$(mkproject a)"
+  q="$(mkproject b)"
+  printf 'A=1\n' >"$p/.env"
+  printf 'A2=1\n' >"$p/.env.local"
+  printf 'B=1\n' >"$q/.env"
+  printf 'B2=1\n' >"$q/.env.local"
+  (cd "$p" && expect_rc 0 save)
+  (cd "$q" && expect_rc 0 save)
+}
+
+all_decrypt_with_key() {
+  local f
+  while IFS= read -r f; do
+    age -d -i "$ENVORA_KEY" "$f" >/dev/null 2>&1 || fail "$f does not decrypt with the current key"
+  done < <(find "$ENVORA_VAULT" -name '*.age' ! -path '*/.git/*')
+}
+
+t_rotate_failed_switch_rolls_back() {
+  rotate_saved_vault
+  install_mv_wrapper
+  local old_key
+  old_key="$(cat "$ENVORA_KEY")"
+  # the key cannot be installed: nothing changes
+  ENVORA_TEST_MV_FAIL="/key.txt" expect_rc 1 rotate --yes
+  assert_contains "$OUT" "cannot install the new key"
+  assert_eq "$(cat "$ENVORA_KEY")" "$old_key"
+  all_decrypt_with_key
+  assert_no_file "$ENVORA_KEY.new"
+  rm -f "$ENVORA_KEY".bak-*
+  # a file cannot be moved halfway: rolled back, old key back in place
+  ENVORA_TEST_MV_FAIL="b/.env.age" expect_rc 1 rotate --yes
+  assert_contains "$OUT" "rolled back"
+  assert_eq "$(cat "$ENVORA_KEY")" "$old_key"
+  all_decrypt_with_key
+  assert_eq "$(git -C "$ENVORA_VAULT" status --porcelain)" ""
+  assert_eq "$(cat "$ENVORA_VAULT/.recipient")" "$(age-keygen -y "$ENVORA_KEY")"
+  [[ -z "$(find "$ENVORA_VAULT" -name '*.envora-*')" ]] || fail "temp files left in the vault"
+}
+
+t_rotate_signal_during_switch_loses_nothing() {
+  rotate_saved_vault
+  install_mv_wrapper
+  ENVORA_TEST_MV_SLOW=0.3 "$TEST_BASH" "$EV" rotate --yes --no-sync </dev/null >"$T/rot.out" 2>&1 &
+  local pid=$! n=0
+  while ! ls "$ENVORA_KEY".bak-* >/dev/null 2>&1; do
+    sleep 0.05
+    n=$((n + 1))
+    [[ $n -lt 400 ]] || fail "rotation never reached the switch"
+  done
+  kill -TERM "$pid" 2>/dev/null || true
+  kill -INT "$pid" 2>/dev/null || true
+  wait "$pid" || true
+  # every file opens with the key in place, whatever happened
+  all_decrypt_with_key
+  assert_eq "$(cat "$ENVORA_VAULT/.recipient")" "$(age-keygen -y "$ENVORA_KEY")"
+  expect_rc 0 sync
+  all_decrypt_with_key
+  assert_eq "$(git -C "$ENVORA_VAULT" status --porcelain)" ""
+}
+
+t_rotate_reencrypts_saves_made_meanwhile() {
+  local key="$T/A/home/.age/key.txt" p pb pw
+  p="$(mkproject app)"
+  printf 'A=1\n' >"$p/.env"
+  (cd "$p" && expect_rc 0 save)
+  new_machine B "$key"
+  pb="$(mkproject app)"
+  pw="$(mkproject web)"
+  (cd "$pb" && expect_rc 0 restore)
+  printf 'A=from-B\n' >"$pb/.env"
+  printf 'W=1\n' >"$pw/.env"
+  use_machine A
+  # B saves with the old key while A pushes its rotation
+  cat >"$ENVORA_VAULT/.git/hooks/pre-push" <<HOOK
+#!/bin/bash
+[ -f "$T/hook.done" ] && exit 0
+touch "$T/hook.done"
+for d in "$pb" "$pw"; do
+  env HOME="$T/B/home" ENVORA_VAULT="$T/B/home/.env-vault" ENVORA_KEY="$T/B/home/.age/key.txt" \
+    ENVORA_PROJECTS="$T/B/home/projects" XDG_STATE_HOME="$T/B/home/.local/state" \
+    GIT_CONFIG_GLOBAL="$T/B/home/.gitconfig" GIT_AUTHOR_DATE="2030-01-01T10:00:00" \
+    GIT_COMMITTER_DATE="2030-01-01T10:00:00" \
+    "$TEST_BASH" "$EV" save -C "\$d" --yes -q </dev/null >>"$T/hook.log" 2>&1
+done
+exit 0
+HOOK
+  chmod +x "$ENVORA_VAULT/.git/hooks/pre-push"
+  cd "$p"
+  expect_rc 0 rotate --yes
+  assert_file "$T/hook.done"
+  assert_contains "$OUT" "saved meanwhile by another machine"
+  all_decrypt_with_key
+  rm "$ENVORA_VAULT/.git/hooks/pre-push"
+  local f
+  for f in app/.env.age web/.env.age; do
+    git --git-dir="$T/remote.git" show "HEAD:$f" | age -d -i "$ENVORA_KEY" >/dev/null 2>&1 ||
+      fail "$f on GitHub is not readable with the new key"
+  done
+  assert_eq "$(remote_commits)" "$(commits)"
+}
+
 t_rotate_pq() {
   age-keygen -pq -o "$T/pqtest" >/dev/null 2>&1 || { echo "age without -pq: skipped"; return 0; }
   local p
@@ -913,6 +1035,20 @@ EOF
   touch "$STUB/vercel.fail"
   expect_rc 1 import vercel --env production
   assert_contains "$OUT" "not authorized"
+}
+
+t_legacy_vercel_copies_flagged() {
+  local p
+  p="$(mkproject web)"
+  printf 'A=1\n' >"$p/.env"
+  cd "$p"
+  expect_rc 0 save
+  printf '# Created by Vercel CLI\nDB="prod"\n' | age -r "$(age-keygen -y "$ENVORA_KEY")" -o "$ENVORA_VAULT/web/.env.production.age"
+  git -C "$ENVORA_VAULT" add -A && git -C "$ENVORA_VAULT" commit -q -m "v0 vercel copy"
+  expect_rc 0 restore --yes -q
+  assert_contains "$OUT" "ev: warning: .env.production is a Vercel snapshot saved by envora 0.x"
+  run_ev doctor
+  assert_contains "$OUT" "ev forget web .env.production"
 }
 
 t_import_vercel_not_linked() {
@@ -1276,6 +1412,21 @@ t_help_and_doctor() {
   assert_contains "$OUT" "✓ key readable"
   assert_contains "$OUT" ".dev.vars.local is not ignored by git"
   assert_eq "$RC" "1"
+  expect_rc 0 save
+  printf '.env*\n.dev.vars*\n' >"$p/.gitignore"
+  run_ev doctor
+  assert_contains "$OUT" "open with your key"
+  # a file only an old key opens, and one no key opens
+  cp "$ENVORA_KEY" "$ENVORA_KEY.bak-20260101-000000"
+  printf 'O=1\n' | age -r "$(age-keygen -y "$ENVORA_KEY")" -o "$ENVORA_VAULT/app/.env.old.age"
+  age-keygen -o "$T/newkey" 2>/dev/null
+  cp "$T/newkey" "$ENVORA_KEY"
+  printf '%s\n' "$(age-keygen -y "$ENVORA_KEY")" >"$ENVORA_VAULT/.recipient"
+  printf 'L=1\n' | age -r "$(age-keygen 2>/dev/null | age-keygen -y)" -o "$ENVORA_VAULT/app/.env.lost.age"
+  run_ev doctor
+  assert_contains "$OUT" "still encrypted for an old key"
+  assert_contains "$OUT" "ev rotate"
+  assert_contains "$OUT" "open with none of your keys: app/.env.lost"
 }
 
 # --- run ---------------------------------------------------------------------
