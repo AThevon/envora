@@ -98,7 +98,7 @@ cmd_doctor() {
       doc_info "no .recipient yet (written by the next save)"
     fi
     if vault_has_remote; then
-      doc_ok "remote: $(vgit remote get-url origin)"
+      doc_ok "remote: $(sanitize_origin "$(vgit remote get-url origin)")"
       vault_net_defaults
       if [[ "${NO_SYNC:-0}" != 1 ]] && ! vgit fetch -q origin 2>"$TMP_ROOT/fetch.err"; then
         SYNC_STATE=offline

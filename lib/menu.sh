@@ -634,7 +634,7 @@ EOF
 preview_sync() {
   preview_title "⇅ Sync with GitHub" "vault ↔ GitHub" "pull the other machines' saves, push yours"
   if vault_has_remote; then
-    out "  remote: $(vgit remote get-url origin)"
+    out "  remote: $(sanitize_origin "$(vgit remote get-url origin)")"
     out "  state:  $(vault_sync_label) ${C_DIM}(as of the last fetch)${C_RST}"
   else
     out "  the vault has no remote: nothing leaves this machine"

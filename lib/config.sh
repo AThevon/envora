@@ -108,17 +108,27 @@ load_config() {
     eval "_RC_$k=''"
   done
 
-  local rc line key val
+  local rc line key val n=0
   rc="$(config_rc_path)"
   if [[ -f "$rc" ]]; then
     while IFS= read -r line || [[ -n "$line" ]]; do
+      n=$((n + 1))
+      line="${line%$'\r'}"
       line="${line#"${line%%[![:space:]]*}"}"
       [[ -z "$line" || "$line" == \#* ]] && continue
       line="${line#export }"
       [[ "$line" == *=* ]] || continue
+      # KEY = value is read like KEY=value
       key="${line%%=*}"
+      key="${key%"${key##*[![:space:]]}"}"
       val="${line#*=}"
-      config_is_known "$key" || continue
+      val="${val#"${val%%[![:space:]]*}"}"
+      if ! config_is_known "$key"; then
+        case "$key" in
+          ENVORA_*) warn "$(config_rc_label) line $n: unknown setting $key: ignored (known: $CONFIG_KEYS)" ;;
+        esac
+        continue
+      fi
       if ! val="$(config_unquote "$val")"; then
         warn "$(config_rc_label): cannot read $key (unsupported quoting): ignored. Set it again: ev config set $key <value>"
         continue

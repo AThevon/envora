@@ -1,11 +1,39 @@
 #!/usr/bin/env bash
 # lib/init.sh - first-time or new-machine setup
 
+# vault_accepts_key PUB KEYFILE -> 0 when the vault (if there is one) is
+# encrypted for this key: its .recipient, or GitHub's after a fetch (the key
+# was rotated on another machine and this vault did not pull it yet), else a
+# vault file it decrypts. Sets VAULT_EXPECTED when it refuses.
+vault_accepts_key() {
+  local pub="$1" keyfile="$2" rec="" rrec="" up sample
+  VAULT_EXPECTED=""
+  vault_exists || return 0
+  rec="$(vault_recipient || true)"
+  [[ -n "$rec" && "$rec" == "$pub" ]] && return 0
+  if vault_has_remote && [[ "${NO_SYNC:-0}" != 1 ]]; then
+    vault_net_defaults
+    vgit fetch -q origin >/dev/null 2>&1 || true
+  fi
+  if up="$(vault_upstream)"; then
+    rrec="$(vgit show "$up:.recipient" 2>/dev/null | head -n 1 | tr -d '[:space:]' || true)"
+    [[ -n "$rrec" && "$rrec" == "$pub" ]] && return 0
+  fi
+  if [[ -n "$rec$rrec" ]]; then
+    VAULT_EXPECTED="${rrec:-$rec}"
+    return 1
+  fi
+  sample="$(find "$ENVORA_VAULT" -name '*.age' -type f ! -path '*/.git/*' 2>/dev/null | LC_ALL=C sort | head -n 1)"
+  [[ -z "$sample" ]] && return 0
+  age -d -i "$keyfile" "$sample" >/dev/null 2>&1
+}
+
 # Install the AGE-SECRET-KEY-... found anywhere in pasted text (a single-line
-# prompt turns the newlines of a pasted key file into spaces). An existing,
+# prompt turns the newlines of a pasted key file into spaces). A key that does
+# not match the vault is refused before anything changes. An existing,
 # different key is kept as <key>.bak-<date>: envora still reads old files with it.
 install_key_from_text() {
-  local text="$1" secret pub old_pub bak n=1
+  local text="$1" secret pub old_pub bak n=1 tmp="$ENVORA_KEY.envora-tmp"
   secret="$(printf '%s\n' "$text" | tr -d '\r' | grep -oE 'AGE-SECRET-KEY-[A-Z0-9-]+' || true)"
   if [[ -z "$secret" ]]; then
     err "no AGE-SECRET-KEY-... found in what you pasted"
@@ -22,24 +50,41 @@ install_key_from_text() {
       ok "this key is already in place ($(printf '%.20s' "$pub")...)"
       return 0
     fi
+  fi
+  register_cleanup "$tmp"
+  {
+    printf '# envora key, imported %s\n' "$(date +%Y-%m-%dT%H:%M:%S)"
+    printf '# public key: %s\n' "$pub"
+    printf '%s\n' "$secret"
+  } >"$tmp"
+  chmod 600 "$tmp"
+  if ! vault_accepts_key "$pub" "$tmp"; then
+    rm -f "$tmp"
+    unregister_cleanup "$tmp"
+    if [[ -n "$VAULT_EXPECTED" ]]; then
+      err "this key is not your vault's key (the vault expects $(printf '%.24s' "$VAULT_EXPECTED")..., this key is $(printf '%.24s' "$pub")...)"
+    else
+      err "this key cannot decrypt the files of your vault: it is not your vault's key"
+    fi
+    if key_exists; then
+      say "  nothing changed: your current key stays in place"
+    fi
+    return 1
+  fi
+  if key_exists; then
     bak="$ENVORA_KEY.bak-$(now_stamp)"
     while [[ -e "$bak" ]]; do n=$((n + 1)); bak="$ENVORA_KEY.bak-$(now_stamp)-$n"; done
     if ! cp -p "$ENVORA_KEY" "$bak" || ! chmod 600 "$bak"; then
+      rm -f "$tmp"
       err "cannot keep the current key as $(tildify "$bak"): nothing changed"
       return 1
     fi
     say "${C_DIM}the previous key is kept at $(tildify "$bak")${C_RST}"
   fi
-  register_cleanup "$ENVORA_KEY.envora-tmp"
-  {
-    printf '# envora key, imported %s\n' "$(date +%Y-%m-%dT%H:%M:%S)"
-    printf '# public key: %s\n' "$pub"
-    printf '%s\n' "$secret"
-  } >"$ENVORA_KEY.envora-tmp"
-  chmod 600 "$ENVORA_KEY.envora-tmp"
-  mv -f "$ENVORA_KEY.envora-tmp" "$ENVORA_KEY"
-  unregister_cleanup "$ENVORA_KEY.envora-tmp"
+  mv -f "$tmp" "$ENVORA_KEY"
+  unregister_cleanup "$tmp"
   KEY_PUB="$pub"
+  ID_ARGS=()
   ok "key saved to $(tildify "$ENVORA_KEY") ($(printf '%.20s' "$pub")...)"
 }
 
@@ -212,6 +257,9 @@ run_init() {
   say "${C_BOLD}2. your vault${C_RST}  ${C_DIM}$(tildify "$ENVORA_VAULT")${C_RST}"
   if vault_exists; then
     ok "vault found"
+    # A key rotated on another machine: its new .recipient comes from GitHub.
+    vault_pull >/dev/null || true
+    vault_unlock
     if [[ -z "$ENVORA_REPO" ]]; then
       local url
       url="$(vgit remote get-url origin 2>/dev/null || true)"
@@ -238,7 +286,7 @@ run_init() {
   # The vault must be encrypted for this key.
   local c
   while ! key_matches_vault; do
-    recipient_mismatch_message
+    recipient_mismatch_message init
     is_interactive || return 1
     c="$(choose "What now?" \
       "Paste the right key now (the current one is kept as .bak)" \

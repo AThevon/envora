@@ -986,6 +986,34 @@ t_init_import_existing_key() {
   assert_contains "$OUT" "previous key is kept"
   ls "$ENVORA_KEY".bak-* >/dev/null 2>&1 || fail "the replaced key was not kept"
   assert_eq "$(age-keygen -y "$ENVORA_KEY")" "$(age-keygen -y "$T/A/home/.age/key.txt")"
+  # a key that is not the vault's is refused: nothing changes on disk
+  local before n_bak
+  before="$(cat "$ENVORA_KEY")"
+  n_bak="$(ls "$ENVORA_KEY".bak-* | wc -l)"
+  RC=0
+  OUT="$(age-keygen 2>/dev/null | "$TEST_BASH" "$EV" init --import-key 2>&1)" || RC=$?
+  assert_eq "$RC" "1"
+  assert_contains "$OUT" "this key is not your vault's key"
+  assert_contains "$OUT" "nothing changed: your current key stays in place"
+  assert_eq "$(cat "$ENVORA_KEY")" "$before"
+  assert_eq "$(ls "$ENVORA_KEY".bak-* | wc -l)" "$n_bak"
+  # rotated on machine A: H imports the new key before its vault pulled it
+  use_machine A
+  (cd "$p" && expect_rc 0 rotate --yes -q)
+  use_machine H
+  RC=0
+  OUT="$(cat "$T/A/home/.age/key.txt" | "$TEST_BASH" "$EV" init --import-key 2>&1)" || RC=$?
+  [[ $RC == 0 ]] || fail "importing the rotated key failed: $OUT"
+  assert_eq "$(age-keygen -y "$ENVORA_KEY")" "$(age-keygen -y "$T/A/home/.age/key.txt")"
+  # a key replaced by mistake: the message points at the .bak that matches
+  use_machine A
+  mv "$ENVORA_KEY" "$ENVORA_KEY.bak-20200101-000000"
+  age-keygen -o "$ENVORA_KEY" 2>/dev/null
+  cd "$p"
+  expect_rc 1 status -q
+  assert_contains "$OUT" "different key than yours (rotated elsewhere? run: ev init --import-key)"
+  expect_rc 1 status
+  assert_contains "$OUT" "your previous key ~/.age/key.txt.bak-20200101-000000 matches this vault"
   # garbage key refused
   use_machine D
   RC=0
@@ -2211,6 +2239,93 @@ t_push_retries_and_key_only_commits() {
   git -C "$ENVORA_VAULT" remote set-url origin "$T/nowhere.git"
   expect_rc 0 save -C "$p" -y -q
   assert_not_contains "$OUT" "PUSH FAILED"
+}
+
+t_odd_paths_are_never_dropped_silently() {
+  local p p2
+  p="$(mkproject app)"
+  printf 'A=1\n' >"$p/.env"
+  mkdir -p "$p/nl"$'\n'"x"
+  printf 'N=1\n' >"$p/nl"$'\n'"x/.env"
+  printf 'W=1\n' >"$p/.env.weird"$'\n'"name"
+  expect_rc 1 save -C "$p" --yes --quiet
+  assert_contains "$OUT" "NOT saved: \$'nl\\nx/.env' (a newline or tab in its path"
+  assert_contains "$OUT" "NOT saved: \$'.env.weird\\nname'"
+  assert_contains "$OUT" "2 env files of this folder NOT in the vault"
+  assert_eq "$(cd "$ENVORA_VAULT/app" && find . -name '*.age' | sort | tr '\n' ' ')" "./.env.age "
+  expect_rc 0 status -C "$p"
+  assert_contains "$OUT" "a newline or tab in its path"
+  rm -rf "$p/nl"$'\n'"x" "$p/.env.weird"$'\n'"name"
+  # a backslash in a folder name: conflicts are decided like any other path
+  mkdir -p "$p/sub\\nx"
+  printf 'S=1\n' >"$p/sub\\nx/.env"
+  expect_rc 0 save -C "$p" --yes -q
+  p2="$T/A/home/elsewhere/app"
+  mkdir -p "$p2"
+  git -C "$p2" init -q
+  git -C "$p2" remote add origin "git@github.com:me/app.git"
+  expect_rc 0 restore -C "$p2" --yes -q
+  printf 'S=2\n' >"$p2/sub\\nx/.env"
+  expect_rc 0 save -C "$p2" --yes -q
+  printf 'S=3\n' >"$p/sub\\nx/.env"
+  expect_rc 0 save -C "$p" --yes
+  assert_contains "$OUT" "replaced the vault's other version"
+  assert_not_contains "$OUT" "while you were answering"
+  assert_eq "$(age -d -i "$ENVORA_KEY" "$ENVORA_VAULT/app/sub\\nx/.env.age")" "S=3"
+}
+
+t_restore_never_writes_outside_or_into_git() {
+  local p pub
+  p="$(mkproject app)"
+  printf 'A=vault\n' >"$p/.env.local"
+  (cd "$p" && expect_rc 0 save -q -y)
+  mkdir -p "$T/outside"
+  printf 'IMPORTANT=1\n' >"$T/outside/file"
+  rm "$p/.env.local"
+  ln -s "$T/outside/file" "$p/.env.local"
+  expect_rc 1 restore -C "$p" --yes -q
+  assert_contains "$OUT" "is a link to $T/outside/file, outside the project"
+  assert_eq "$(cat "$T/outside/file")" "IMPORTANT=1"
+  # forged vault names inside .git or a dependency folder are refused
+  pub="$(age-keygen -y "$ENVORA_KEY")"
+  mkdir -p "$ENVORA_VAULT/app/.git/hooks" "$ENVORA_VAULT/app/sub/.git" "$ENVORA_VAULT/app/node_modules/x"
+  printf 'X=1\n' | age -r "$pub" -o "$ENVORA_VAULT/app/.git/hooks/.env.age"
+  printf 'X=1\n' | age -r "$pub" -o "$ENVORA_VAULT/app/sub/.git/.env.age"
+  printf 'X=1\n' | age -r "$pub" -o "$ENVORA_VAULT/app/node_modules/x/.env.age"
+  git -C "$ENVORA_VAULT" add -A && git -C "$ENVORA_VAULT" commit -q -m forged
+  rm "$p/.env.local"
+  expect_rc 1 restore -C "$p" --yes -q
+  assert_contains "$OUT" "refusing to restore '.git/hooks/.env'"
+  assert_contains "$OUT" "refusing to restore 'sub/.git/.env'"
+  assert_contains "$OUT" "refusing to restore 'node_modules/x/.env'"
+  assert_no_file "$p/.git/hooks/.env"
+  assert_no_file "$p/sub"
+  assert_no_file "$p/node_modules"
+  assert_eq "$(cat "$p/.env.local")" "A=vault"
+}
+
+t_vault_remote_credentials_never_shown() {
+  local p
+  p="$(mkproject app)"
+  printf 'A=1\n' >"$p/.env"
+  (cd "$p" && expect_rc 0 save -q -y)
+  git -C "$ENVORA_VAULT" remote set-url origin "https://me:ghp_SECRETTOKEN123@127.0.0.1:9/me/env-vault.git"
+  run_ev doctor --no-sync
+  assert_not_contains "$OUT" "ghp_SECRETTOKEN123"
+  assert_contains "$OUT" "remote: https://127.0.0.1:9/me/env-vault.git"
+  OUT="$("$TEST_BASH" "$EV" _preview sync 2>&1)"
+  assert_not_contains "$OUT" "ghp_SECRETTOKEN123"
+}
+
+t_config_rc_spaces_and_unknown_keys() {
+  cat >"$HOME/.envorarc" <<'EOF'
+ ENVORA_WRANGLER_CMD = wrangler
+ENVORA_VAULTT=/somewhere
+EOF
+  expect_rc 0 config get wrangler-cmd
+  assert_contains "$OUT" "line 2: unknown setting ENVORA_VAULTT"
+  assert_contains "$OUT" "wrangler"
+  assert_eq "$("$TEST_BASH" "$EV" config get wrangler-cmd 2>/dev/null)" "wrangler"
 }
 
 # --- run ---------------------------------------------------------------------
