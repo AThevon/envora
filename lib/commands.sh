@@ -480,7 +480,11 @@ cmd_forget() {
   rm -rf -- "${ENVORA_VAULT:?}/$target"
   local msg="forget: $name"
   [[ -n "$file" ]] && msg="forget: $name ($file)"
-  vault_commit "$msg" "$name" || true
+  vault_identity
+  vgit commit -q -m "$msg" 2>"$TMP_ROOT/git.err" || {
+    err "cannot commit in the vault: $(head -n 1 "$TMP_ROOT/git.err")"
+    return 1
+  }
   local push_rc=0
   vault_push || push_rc=$?
   ok "removed $what from the vault$(push_suffix "$push_rc")"

@@ -185,18 +185,18 @@ scan_project() {
 vault_project_files() {
   local base="$ENVORA_VAULT/$1" f
   [[ -d "$base" ]] || return 0
-  find "$base" -type f -name '*.age' ! -path "$base/@*" 2>/dev/null |
+  find "$base" -type f -name '*.age' ! -path "$base/@vercel/*" 2>/dev/null |
     while IFS= read -r f; do
       f="${f#"$base"/}"
       printf '%s\n' "${f%.age}"
     done | LC_ALL=C sort
 }
 
-# vault_snapshot_files NAME -> relpaths under @provider dirs (e.g. @vercel/production.env)
+# vault_snapshot_files NAME -> platform snapshots (e.g. @vercel/production.env)
 vault_snapshot_files() {
   local base="$ENVORA_VAULT/$1" f
   [[ -d "$base" ]] || return 0
-  find "$base" -type f -name '*.age' -path "$base/@*" 2>/dev/null |
+  find "$base" -type f -name '*.age' -path "$base/@vercel/*" 2>/dev/null |
     while IFS= read -r f; do
       f="${f#"$base"/}"
       printf '%s\n' "${f%.age}"

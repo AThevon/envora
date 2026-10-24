@@ -88,9 +88,42 @@ vault_repair() {
   fi
 }
 
+# One ev at a time touches the vault's git state (hooks may run in parallel).
+VAULT_LOCK=""
+vault_lock() {
+  [[ -n "$VAULT_LOCK" ]] && return 0
+  local gd lock pid n=0
+  gd="$(vgit rev-parse --absolute-git-dir 2>/dev/null)" || return 1
+  lock="$gd/envora.lock"
+  while ! mkdir "$lock" 2>/dev/null; do
+    pid="$(cat "$lock/pid" 2>/dev/null || true)"
+    if [[ -n "$pid" ]] && ! kill -0 "$pid" 2>/dev/null; then
+      rm -rf "$lock"
+      continue
+    fi
+    n=$((n + 1))
+    if [[ $n -ge 300 ]]; then
+      err "the vault is busy: another ev is running (lock: $lock)"
+      return 1
+    fi
+    sleep 0.1
+  done
+  printf '%s\n' "$$" >"$lock/pid"
+  VAULT_LOCK="$lock"
+  register_cleanup "$lock"
+}
+
+vault_unlock() {
+  [[ -n "$VAULT_LOCK" ]] || return 0
+  rm -rf "$VAULT_LOCK"
+  unregister_cleanup "$VAULT_LOCK"
+  VAULT_LOCK=""
+}
+
 # Bring the vault up to date with GitHub before reading it.
 vault_pull() {
   SYNC_PULLED=0
+  vault_lock || return 1
   vault_repair || return 1
   if [[ "${NO_SYNC:-0}" == 1 ]]; then
     SYNC_STATE=skipped

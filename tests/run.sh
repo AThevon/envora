@@ -858,6 +858,7 @@ t_deprecated_aliases() {
   assert_contains "$OUT" '"vercel" is deprecated, use "import vercel"'
   expect_rc 0 clean app --yes
   assert_no_file "$ENVORA_VAULT/app"
+  assert_eq "$(git -C "$ENVORA_VAULT" log -1 --format=%s)" "forget: app"
 }
 
 t_hooks_contract() {
@@ -898,6 +899,26 @@ t_hooks_contract() {
     expect_rc 1 save -C "$p" --yes --quiet
   fi
   chmod 600 "$ENVORA_KEY"
+}
+
+t_parallel_saves_are_serialized() {
+  local p q
+  p="$(mkproject app1)"
+  q="$(mkproject app2)"
+  printf 'A=1\n' >"$p/.env"
+  printf 'B=1\n' >"$q/.env"
+  "$TEST_BASH" "$EV" save -C "$p" --yes --quiet </dev/null >"$T/out1" 2>&1 &
+  local pid1=$!
+  "$TEST_BASH" "$EV" save -C "$q" --yes --quiet </dev/null >"$T/out2" 2>&1 &
+  local pid2=$!
+  local rc1=0 rc2=0
+  wait "$pid1" || rc1=$?
+  wait "$pid2" || rc2=$?
+  assert_eq "$rc1:$rc2" "0:0" "both saves succeed: $(cat "$T/out1" "$T/out2")"
+  assert_file "$ENVORA_VAULT/app1/.env.age"
+  assert_file "$ENVORA_VAULT/app2/.env.age"
+  assert_eq "$(remote_commits)" "$(commits)"
+  assert_no_file "$(git -C "$ENVORA_VAULT" rev-parse --absolute-git-dir)/envora.lock"
 }
 
 t_status_report() {
@@ -941,6 +962,8 @@ t_list_and_forget() {
   assert_eq "$(git -C "$ENVORA_VAULT" log -1 --format=%s)" "forget: app (.env.local)"
   expect_rc 0 forget app --yes
   assert_no_file "$ENVORA_VAULT/app"
+  assert_eq "$(git -C "$ENVORA_VAULT" log -1 --format=%s)" "forget: app"
+  assert_eq "$(git -C "$ENVORA_VAULT" status --porcelain)" ""
   assert_eq "$(remote_commits)" "$(commits)"
 }
 

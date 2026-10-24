@@ -91,6 +91,7 @@ menu_items_global() {
 cmd_menu() {
   ui_logo
   vault_pull >/dev/null 2>&1 || true
+  vault_unlock
   local choice in_project=0
   if detect_current_project 2>/dev/null; then
     in_project=1
