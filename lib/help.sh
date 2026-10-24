@@ -8,7 +8,7 @@ help_diagram() {
   ${d}your .env files${r}         ${d}encrypted copies (git)${r}    ${d}private repo${r}
      │   ${a}save    →${r}            │   ${a}sync    ↔${r}             │
      │   ${a}← restore${r}            │                         │
-     │   ${a}status  ↔${r}            │
+     │   ${a}status  ↔${r}            │                         │
                               │   ${a}export  →${r}   ${b}PLATFORMS${r}
                               │   ${a}← import${r}    ${d}Vercel, Cloudflare${r}
 EOF
@@ -26,9 +26,12 @@ ${b}PROJECT ↔ VAULT${r}
   ${a}ev restore${r}   [name] [--force]       vault → project    write the saved files back (asks before overwriting)
   ${a}ev status${r}    [name] [--values]      project ↔ vault    what differs, key names only (--values: real diff)
 
+${b}VAULT${r}
+  ${a}ev list${r}                             vault              every project in the vault
+  ${a}ev forget${r}    <name> [file]          vault              remove a project (or one file) from the vault
+
 ${b}VAULT ↔ GITHUB${r}
   ${a}ev sync${r}                             vault ↔ GitHub     pull, merge, push; reports what moved
-  ${a}ev list${r}                             vault              every project in the vault
 
 ${b}VAULT ↔ PLATFORMS${r}
   ${a}ev import vercel${r}   [--env e]        Vercel → vault     snapshot Vercel env vars into the vault
@@ -38,7 +41,6 @@ ${b}VAULT ↔ PLATFORMS${r}
 ${b}MAINTENANCE${r}
   ${a}ev${r}                                  interactive menu with a live preview of every action
   ${a}ev doctor${r}                           check the setup, with a fix for each problem
-  ${a}ev forget${r}    <name> [file]          remove a project (or one file) from the vault
   ${a}ev rotate${r}    [--pq]                 new key, re-encrypt everything
   ${a}ev init${r}                             first-time or new-machine setup
   ${a}ev config${r}    [get|set ...]          settings (~/.envorarc)
@@ -52,9 +54,9 @@ ${b}GLOBAL FLAGS${r} ${d}(anywhere on the line)${r}
   -h, --help     help · -v, --version
 
 ${b}EXIT CODES${r}
-  0 done (for save: saved AND pushed to GitHub, or nothing to do)
+  0 done (for save: every env file of the folder is in the vault AND on GitHub)
   3 saved and committed in the local vault but NOT pushed to GitHub
-  1 error: nothing is guaranteed
+  1 error, or some env files are not in the vault: nothing is guaranteed
 EOF
 }
 
@@ -72,14 +74,20 @@ Encrypts the env files of the project into the vault, commits and pushes to GitH
   · skips *.example *.sample *.template *.dist *.defaults .envrc and files tracked by git
   · only re-encrypts files whose content changed: a no-op save creates no commit
   · files in the vault but missing here are kept (ev forget NAME FILE removes them)
+  · two machines: a file you did not edit while another machine saved a newer
+    version is left alone (ev restore brings the newer one); a file edited on both
+    sides is asked about (with --yes: yours is saved, the other version stays in
+    git history and a warning names its commit)
 
 Project name: --as, else the git origin repo name, else the main worktree folder.
-The vault entry remembers its origin URL; a different repo with the same name is refused.
+The vault entry remembers its origin URL: a different repo with the same name, or a
+folder without a git origin, is refused (--as NAME says it really is that project).
 
 ${b}exit codes${r} (for scripts, e.g. before deleting a folder)
-  0 saved (or nothing to save) AND pushed to GitHub
+  0 every env file of the folder is in the vault AND pushed to GitHub (or nothing to save)
   3 saved and committed locally but NOT pushed (offline / rejected): decide yourself
-  1 failure: nothing is guaranteed, do not delete anything
+  1 failure, or env files envora does not reach (deeper than 4 levels, inside build/,
+    dist/, vendor/) or not saved: nothing is guaranteed, do not delete anything
 
 ${d}example: ev save -C ~/projects/app --yes --quiet${r}
 EOF
@@ -90,14 +98,18 @@ ${b}ev restore${r} [name] [-C dir] [--force]        ${a}vault → project${r}
 
 Writes the saved env files back into the project.
   · identical files are skipped
-  · a local file that differs is shown (key names only) and you are asked
+  · a newer version saved by another machine replaces a copy you did not edit
+  · a local file you edited is shown (key names only) and you are asked
   · with --yes, --force or without a terminal: the local file is backed up first
     (encrypted, ~/.local/state/envora/backups/<project>/, last 10 kept), then replaced
   · each file is written atomically with mode 600
   · only env file names are restored, never outside the project folder
+  · refused when the vault entry belongs to another repository (--as NAME to force)
 
 NAME outside the project: uses \$ENVORA_PROJECTS/NAME ($ENVORA_PROJECTS).
 Exit 0 also when there is nothing to restore.
+Read a backup: age -d -i $(tildify "$ENVORA_KEY") <backup>.age (made before a rotation:
+use the <key>.bak-<date> kept by ev rotate).
 
 ${d}example (after a clone): ev restore -C ~/projects/app --yes --quiet${r}
 EOF
@@ -108,8 +120,11 @@ ${b}ev status${r} [name] [--values]        ${a}project ↔ vault${r}
 
 For each file: in sync, changed (which keys were added, removed or changed: names only),
 only in project (not saved yet), only in vault (missing here), tracked by git (skipped).
+Files edited here AND saved by another machine are flagged, so are newer vault versions.
+Vercel snapshots (ev import vercel) are listed and compared with .env.<env>.
 Then the vault ↔ GitHub state: synced, N to push, N to pull, offline.
---values prints a real diff of the changed files (values visible on screen).
+--values prints a real diff of the changed files and the snapshot contents
+(values visible on screen).
 EOF
       ;;
     list)
@@ -140,7 +155,8 @@ vault/<project>/@vercel/<env>.env. Your project files are never touched.
   · VERCEL_OIDC_TOKEN is dropped (short-lived)
   · Secret (sensitive) variables are write-only on Vercel: their value comes back as
     [SENSITIVE]; envora keeps the value from the previous snapshot when it has one
-    and tells you how many stay unknown
+    (it may be stale) and tells you how many stay unknown
+  · snapshots are never restored into the project: ev status --values shows them
 Uses 'vercel' from PATH, else npx vercel@$VERCEL_PINNED (override: ENVORA_VERCEL_CMD).
 EOF
       ;;
@@ -155,6 +171,9 @@ Sends a saved file from the vault to Vercel.
     .env.development → development (otherwise --file and --env)
   · plan by names against 'vercel env ls': add (new), update (existing), kept (only on Vercel)
   · values go through stdin, never on the command line; nothing is deleted
+  · a variable that also serves other environments is skipped unless you confirm
+    (or --update-shared): updating it changes them all
+  · skipped too: keys with branch-specific values, empty values, values over 60 KB
   · asks before applying (--yes to skip, --dry-run to only show the plan)
 EOF
           ;;
@@ -163,13 +182,15 @@ EOF
 ${b}ev export cloudflare${r} [--env e] [--file f] [--dry-run] [-C dir]        ${a}vault → Cloudflare${r}
 
 Uploads a saved file from the vault as Worker (or Pages) secrets.
-  · source: .dev.vars.<env> / .dev.vars, else .env.<env> / .env (or --file)
+  · source: .dev.vars, else .env; with --env e: .dev.vars.<e>, else .env.<e>
+    (never your local .dev.vars unless you pass --file)
   · warns when your local file differs from the vault copy (save first?)
   · plan by names against 'wrangler secret list': add, update, only on Cloudflare (kept)
   · secrets are piped as JSON to 'wrangler secret bulk' (never written to disk);
-    Pages projects use 'wrangler pages secret bulk'
+    Pages projects use 'wrangler pages secret bulk' (production / preview)
   · this deploys immediately: asks first (--yes to skip, --dry-run for the plan only)
-  · monorepos: runs wrangler in the folder holding wrangler.toml / wrangler.json(c)
+  · monorepos: runs wrangler in the folder holding wrangler.toml / wrangler.json(c);
+    the one around the current folder is picked, else -C <dir>
 Uses 'wrangler' from PATH, else npx wrangler@$WRANGLER_PINNED (override: ENVORA_WRANGLER_CMD).
 
 See also: ev export vercel
@@ -179,10 +200,11 @@ EOF
       ;;
     forget|clean)
       cat <<EOF
-${b}ev forget${r} <name> [file]        ${a}vault${r}
+${b}ev forget${r} [name] [file]        ${a}vault${r}
 
 Removes a project, or one of its files, from the vault (asks first; --yes in scripts).
-Old versions remain in git history.
+Without a name, in a terminal: pick the project. Old versions remain in git history.
+Paths are relative to the project: ev forget app apps/web/.env.local
 EOF
       ;;
     rotate)
@@ -191,6 +213,9 @@ ${b}ev rotate${r} [--pq]        ${a}vault${r}
 
 Creates a new key, re-encrypts every file of the vault with it, verifies each one,
 keeps the old key as <key>.bak-<date>, commits and pushes, then shows the new key once.
+The switch cannot be interrupted halfway (Ctrl-C waits for it); if it fails, it rolls
+back. Run it again to finish an interrupted rotation or to re-encrypt files another
+machine saved with the old key. Other machines: ev init --import-key.
 --pq creates a post-quantum hybrid key (age >= 1.3).
 
 Old ciphertexts remain in git history: if your key leaked, also rotate the secrets
@@ -212,7 +237,9 @@ ${b}ev init${r} [--import-key | --generate-key] [--repo user/name | --create nam
 First-time or new-machine setup.
   1. key: import your existing envora key (from your password manager) or generate one
   2. vault: clone your existing vault repo, or create a new private one with gh
-If the vault was encrypted for another key, init explains it and stops.
+If the vault was encrypted for another key, init explains it and offers to paste the
+right one. --import-key also replaces an existing key (after a rotation on another
+machine): the previous one is kept as <key>.bak-<date>.
 Without a terminal, --import-key reads the key from stdin.
 EOF
       ;;
