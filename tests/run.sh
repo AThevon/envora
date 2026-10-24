@@ -1566,6 +1566,12 @@ t_help_and_doctor() {
   assert_contains "$OUT" "still encrypted for an old key"
   assert_contains "$OUT" "ev rotate"
   assert_contains "$OUT" "open with none of your keys: app/.env.lost"
+  # an fzf too old for the menu is reported
+  mkdir -p "$T/oldfzf"
+  printf '#!/bin/sh\necho "0.44.1 (debian)"\n' >"$T/oldfzf/fzf"
+  chmod +x "$T/oldfzf/fzf"
+  PATH="$T/oldfzf:$PATH" run_ev doctor
+  assert_contains "$OUT" "fzf 0.44.1 is too old for the menu"
 }
 
 # --- run ---------------------------------------------------------------------
