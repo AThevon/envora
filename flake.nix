@@ -15,6 +15,10 @@
           envora = pkgs.callPackage ./default.nix {};
           default = self.packages.${system}.envora;
         };
+
+        devShells.default = pkgs.mkShell {
+          packages = with pkgs; [ age fzf gum gh git jq shellcheck ];
+        };
       }
     ) // {
       overlays.default = final: prev: {
