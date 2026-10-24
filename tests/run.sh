@@ -284,13 +284,15 @@ t_monorepo_nested_files() {
   printf 'NO=1\n' >"$p/node_modules/pkg/.env"
   printf 'DEEP=1\n' >"$p/a/b/c/d/.env"
   cd "$p/apps/web"
-  expect_rc 0 save
+  # too deep for the scan: saved files are saved, but exit 1 (do not delete)
+  expect_rc 1 save
+  assert_contains "$OUT" "NOT saved: a/b/c/d/.env"
   assert_file "$ENVORA_VAULT/mono/apps/web/.env.local.age"
   assert_file "$ENVORA_VAULT/mono/apps/api/.dev.vars.age"
   assert_no_file "$ENVORA_VAULT/mono/node_modules"
   assert_no_file "$ENVORA_VAULT/mono/a"
   assert_contains "$(git -C "$ENVORA_VAULT" log -1 --format=%s)" "apps/web/.env.local"
-  rm -rf "$p/apps/web/.env.local" "$p/apps/api"
+  rm -rf "$p/apps/web/.env.local" "$p/apps/api" "$p/a"
   expect_rc 0 restore
   assert_eq "$(cat "$p/apps/api/.dev.vars")" "API=1"
   assert_eq "$(cat "$p/apps/web/.env.local")" "WEB=1"
@@ -313,6 +315,21 @@ t_tracked_files_skipped() {
   expect_rc 0 restore --yes
   assert_eq "$(cat "$p/.env.test")" "COMMITTED=1"
   assert_contains "$OUT" "tracked by git here"
+  git -C "$ENVORA_VAULT" add -A && git -C "$ENVORA_VAULT" commit -q -m tracked
+  expect_rc 0 forget app .env --yes
+  expect_rc 0 restore --yes
+  assert_contains "$OUT" "nothing restored: 1 file of the vault tracked by git here"
+  assert_not_contains "$OUT" "0 files identical"
+  # paths are literal for git: [x]/.env is not x/.env
+  mkdir -p "$p/x" "$p/[x]"
+  printf 'X=tracked\n' >"$p/x/.env"
+  git -C "$p" add -f x/.env && git -C "$p" commit -q -m x
+  printf 'X=bracket\n' >"$p/[x]/.env"
+  expect_rc 0 save
+  assert_file "$ENVORA_VAULT/app/[x]/.env.age"
+  rm "$p/[x]/.env"
+  expect_rc 0 restore
+  assert_eq "$(cat "$p/[x]/.env")" "X=bracket"
 }
 
 t_file_patterns() {
@@ -481,6 +498,105 @@ t_two_machines_same_file_newest_wins() {
   assert_contains "$(cat "$pb/.env")" "FROM_A"
 }
 
+t_stale_copy_never_overwrites_newer_vault() {
+  local key="$T/A/home/.age/key.txt" p pb
+  p="$(mkproject app)"
+  printf 'TOKEN=old\n' >"$p/.env.local"
+  (cd "$p" && expect_rc 0 save --yes -q)
+  new_machine B "$key"
+  pb="$(mkproject app)"
+  cd "$pb"
+  expect_rc 0 restore --yes -q
+  printf 'TOKEN=new-rotated\n' >"$pb/.env.local"
+  expect_rc 0 save --yes -q
+  # A never touched its copy: it is stale, not newer
+  use_machine A
+  cd "$p"
+  expect_rc 0 status
+  assert_contains "$OUT" "newer in the vault"
+  expect_rc 0 save -C . --yes
+  assert_contains "$OUT" "kept it"
+  assert_eq "$(age -d -i "$ENVORA_KEY" "$ENVORA_VAULT/app/.env.local.age")" "TOKEN=new-rotated"
+  # restore updates the stale copy without asking (backup kept)
+  expect_rc 0 restore
+  assert_eq "$(cat "$p/.env.local")" "TOKEN=new-rotated"
+  # both edited: --yes keeps this copy but says loudly what it replaced
+  printf 'TOKEN=from-A\n' >"$p/.env.local"
+  use_machine B
+  printf 'TOKEN=from-B\n' >"$pb/.env.local"
+  (cd "$pb" && expect_rc 0 save --yes -q)
+  use_machine A
+  expect_rc 0 status
+  assert_contains "$OUT" "changed here AND in the vault"
+  expect_rc 0 save --yes -q
+  assert_contains "$OUT" "ev: warning: .env.local: the vault had a newer version from another machine (commit "
+  assert_contains "$OUT" "the other version stays in git history"
+  assert_eq "$(age -d -i "$ENVORA_KEY" "$ENVORA_VAULT/app/.env.local.age")" "TOKEN=from-A"
+}
+
+t_restore_and_save_check_origin() {
+  local p fork plain bare
+  p="$(mkproject app "git@github.com:me/app.git")"
+  printf 'MY_SECRET=1\n' >"$p/.env"
+  (cd "$p" && expect_rc 0 save)
+  # a homonym clone of someone else's repo: nothing is written into it
+  fork="$T/A/home/elsewhere/app"
+  mkdir -p "$fork"
+  git -C "$fork" init -q
+  git -C "$fork" remote add origin "https://github.com/stranger/app.git"
+  expect_rc 1 restore -C "$fork" --yes --quiet
+  assert_contains "$OUT" "ev: error: the vault entry 'app' belongs to another repository"
+  assert_no_file "$fork/.env"
+  # a folder without git, or a repo without remote, cannot overwrite the entry
+  plain="$T/A/home/Downloads/app"
+  mkdir -p "$plain"
+  printf 'MY_SECRET=other\n' >"$plain/.env"
+  expect_rc 1 save -C "$plain" --yes
+  assert_contains "$OUT" "has no git origin"
+  bare="$T/A/home/tmp2/app"
+  mkdir -p "$bare"
+  git -C "$bare" init -q
+  printf 'MY_SECRET=other\n' >"$bare/.env"
+  expect_rc 1 save -C "$bare" --yes
+  assert_eq "$(age -d -i "$ENVORA_KEY" "$ENVORA_VAULT/app/.env.age")" "MY_SECRET=1"
+  # an explicit --as says "this is that project"
+  expect_rc 0 restore -C "$fork" --as app --yes
+  assert_file "$fork/.env"
+}
+
+t_legacy_name_and_folder_guard() {
+  local p
+  p="$(mkproject victor "git@github.com:me/victordenay.git")"
+  printf 'K=1\n' >"$p/.env"
+  (cd "$p" && expect_rc 0 save)
+  assert_file "$ENVORA_VAULT/victordenay/.env.age"
+  printf 'K=2\n' >"$p/.env"
+  cd "$T"
+  # the old wipe hook names the folder: same vault entry as inside the project
+  expect_rc 0 push-local victor
+  assert_no_file "$ENVORA_VAULT/victor"
+  assert_eq "$(age -d -i "$ENVORA_KEY" "$ENVORA_VAULT/victordenay/.env.age")" "K=2"
+  # an entry saved by envora 0.x under the folder name is still found
+  local q
+  q="$(mkproject old-folder "git@github.com:me/new-name.git")"
+  mkdir -p "$ENVORA_VAULT/old-folder"
+  printf 'OLD=1\n' | age -r "$(age-keygen -y "$ENVORA_KEY")" -o "$ENVORA_VAULT/old-folder/.env.age"
+  git -C "$ENVORA_VAULT" add -A && git -C "$ENVORA_VAULT" commit -q -m "v0 entry"
+  cd "$q"
+  expect_rc 0 restore
+  assert_eq "$(cat "$q/.env")" "OLD=1"
+  # never a folder of projects, never home
+  mkdir -p "$T/A/home/work"
+  mv "$p" "$T/A/home/work/victor"
+  expect_rc 1 save -C "$T/A/home/work/" --yes
+  assert_contains "$OUT" "looks like a folder of projects"
+  expect_rc 1 save -C "$ENVORA_PROJECTS" --yes
+  assert_contains "$OUT" "is not a project folder"
+  expect_rc 1 save -C "$HOME" --yes
+  assert_no_file "$ENVORA_VAULT/work"
+  assert_no_file "$ENVORA_VAULT/home"
+}
+
 t_push_failure_exit_3() {
   local p
   p="$(mkproject app)"
@@ -492,7 +608,7 @@ t_push_failure_exit_3() {
   printf 'A=2\n' >"$p/.env"
   expect_rc 3 save
   assert_contains "$OUT" "PUSH FAILED"
-  assert_contains "$OUT" "cannot reach the vault remote"
+  assert_contains "$OUT" "cannot reach GitHub"
   mv "$T/remote.gone" "$T/remote.git"
   expect_rc 0 sync
   assert_eq "$(remote_commits)" "$(commits)"
@@ -502,6 +618,60 @@ t_push_failure_exit_3() {
   printf 'A=3\n' >"$p/.env"
   expect_rc 3 save
   assert_contains "$OUT" "NOT pushed"
+}
+
+t_vault_never_commits_unmanaged_files() {
+  local p pub head
+  p="$(mkproject app)"
+  printf 'A=1\n' >"$p/.env"
+  cd "$p"
+  expect_rc 0 save
+  printf '*.plain\n' >"$ENVORA_VAULT/.gitignore"
+  git -C "$ENVORA_VAULT" add .gitignore && git -C "$ENVORA_VAULT" commit -q -m ignore
+  printf 'STRIPE=sk_live_plain\n' >"$ENVORA_VAULT/backup.plain"
+  printf 'notes\n' >"$ENVORA_VAULT/README.md"
+  pub="$(age-keygen -y "$ENVORA_KEY")"
+  # an interrupted save left a re-encrypted file uncommitted
+  printf 'A=2\n' | age -r "$pub" -o "$ENVORA_VAULT/app/.env.age"
+  expect_rc 0 sync
+  assert_eq "$(git -C "$ENVORA_VAULT" log -1 --format=%s)" "envora: record changes left uncommitted"
+  git --git-dir="$T/remote.git" show HEAD:backup.plain >/dev/null 2>&1 && fail "an ignored plaintext file reached the remote"
+  git --git-dir="$T/remote.git" show HEAD:README.md >/dev/null 2>&1 && fail "an unmanaged file was committed"
+  assert_eq "$(git --git-dir="$T/remote.git" show HEAD:app/.env.age | age -d -i "$ENVORA_KEY")" "A=2"
+  # an uncommitted file the key cannot decrypt is refused, loudly
+  head="$(git -C "$ENVORA_VAULT" rev-parse HEAD)"
+  printf 'X=1\n' | age -r "$(age-keygen 2>/dev/null | age-keygen -y)" -o "$ENVORA_VAULT/app/.env.age"
+  expect_rc 1 status
+  assert_contains "$OUT" "your key cannot decrypt"
+  assert_eq "$(git -C "$ENVORA_VAULT" rev-parse HEAD)" "$head" "nothing committed"
+}
+
+t_sync_labels_offline_and_no_sync() {
+  local p
+  p="$(mkproject app)"
+  printf 'A=1\n' >"$p/.env"
+  cd "$p"
+  expect_rc 0 save
+  mv "$T/remote.git" "$T/remote.gone"
+  printf 'A=2\n' >"$p/.env"
+  expect_rc 3 save
+  assert_contains "$OUT" "! 1 file saved to the vault"
+  expect_rc 0 status
+  assert_contains "$OUT" "offline · ↑ 1 to push (not on GitHub yet)"
+  mv "$T/remote.gone" "$T/remote.git"
+  expect_rc 0 sync
+  # --no-sync never claims to be in sync
+  new_machine B "$T/A/home/.age/key.txt"
+  use_machine A
+  printf 'A=3\n' >"$p/.env"
+  (cd "$p" && expect_rc 0 save)
+  use_machine B
+  local pb
+  pb="$(mkproject app)"
+  cd "$pb"
+  expect_rc 0 status --no-sync
+  assert_contains "$OUT" "not checked with GitHub (--no-sync)"
+  assert_not_contains "$OUT" "synced with GitHub"
 }
 
 t_restore_backup_no_silent_overwrite() {
@@ -960,7 +1130,7 @@ t_list_and_forget() {
   expect_rc 0 list
   assert_contains "$OUT" "app"
   assert_contains "$OUT" "2 files"
-  assert_contains "$OUT" "here: ~/projects/app"
+  assert_contains "$OUT" "on this machine: ~/projects/app"
   expect_rc 1 forget app .env.local
   assert_contains "$OUT" "add --yes"
   expect_rc 0 forget app .env.local --yes

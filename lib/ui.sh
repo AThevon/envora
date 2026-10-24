@@ -35,6 +35,19 @@ ok() {
   printf '%s✓%s %s\n' "$C_ACC" "$C_RST" "$*" >&2
 }
 
+# Like ok, but for a result that is only partly done (e.g. not pushed).
+partial() {
+  [[ "${QUIET:-0}" == 1 ]] && return 0
+  printf '%s!%s %s\n' "$C_WARN" "$C_RST" "$*" >&2
+}
+
+# result RC message: ✓ when RC is 0, ! otherwise (exit 3: saved, not pushed).
+result() {
+  local rc="$1"
+  shift
+  if [[ "$rc" == 0 ]]; then ok "$@"; else partial "$@"; fi
+}
+
 step() {
   [[ "${QUIET:-0}" == 1 ]] && return 0
   printf '%s·%s %s\n' "$C_DIM" "$C_RST" "$*" >&2
