@@ -12,6 +12,11 @@ ev_cleanup() {
   if [[ -n "${VAULT_GIT_OP:-}" ]]; then
     vault_abort_op 2>/dev/null || true
   fi
+  # A save interrupted before its commit: nothing of it may be published by
+  # the next command.
+  if [[ "${VAULT_INFLIGHT:-0}" == 1 ]]; then
+    vault_inflight_revert >/dev/null 2>&1 || true
+  fi
   set -f
   IFS=$'\n'
   for p in $CLEANUP_LIST; do
@@ -104,17 +109,18 @@ is_env_name() {
   return 1
 }
 
-# A relative path coming from the vault: no "..", no absolute path, env name.
+# A relative path coming from the vault: no "..", no absolute path, no .git
+# folder, env name.
 valid_relpath() {
   local p="$1" c old_ifs="$IFS" bad=0
   [[ -n "$p" ]] || return 1
   case "$p" in
-    /*|*//*|*$'\n'*) return 1 ;;
+    /*|*//*|*$'\n'*|*$'\t'*) return 1 ;;
   esac
   set -f
   IFS=/
   for c in $p; do
-    if [[ -z "$c" || "$c" == "." || "$c" == ".." ]]; then bad=1; fi
+    if [[ -z "$c" || "$c" == "." || "$c" == ".." || "$c" == ".git" ]]; then bad=1; fi
   done
   IFS="$old_ifs"
   set +f

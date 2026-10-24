@@ -284,8 +284,16 @@ envora_ignored() {
   return 1
 }
 
+# A path envora cannot store: a newline or a tab in it (the vault and the
+# plans are line based). Recorded, shown escaped, and never silently dropped.
+record_badname() {
+  local q
+  q="$(printf '%q' "$1")"
+  grep -Fxq -- "$q" "$TMP_ROOT/scan.badnames" 2>/dev/null || printf '%s\n' "$q" >>"$TMP_ROOT/scan.badnames"
+}
+
 # scan_project DIR -> writes $TMP_ROOT/scan.files (handled), scan.tracked,
-# scan.ignored (.envoraignore)
+# scan.ignored (.envoraignore), scan.badnames (paths with a newline or tab)
 scan_project() {
   local dir="$1" f rel prune_expr=() d
   for d in $PRUNE_DIRS; do
@@ -295,11 +303,12 @@ scan_project() {
   done
   : >"$TMP_ROOT/scan.all"
   : >"$TMP_ROOT/scan.ignored"
+  : >"$TMP_ROOT/scan.badnames"
   find "$dir" -maxdepth "$SCAN_DEPTH" \
     \( -type d \( "${prune_expr[@]}" \) -prune \) -o \
     \( -type f -o -type l \) \
-    \( -name '.env' -o -name '.env.*' -o -name '.dev.vars' -o -name '.dev.vars.*' \) -print 2>/dev/null |
-    while IFS= read -r f; do
+    \( -name '.env' -o -name '.env.*' -o -name '.dev.vars' -o -name '.dev.vars.*' \) -print0 2>/dev/null |
+    while IFS= read -r -d '' f; do
       rel="${f#"$dir"/}"
       is_env_name "${rel##*/}" || continue
       [[ -f "$f" ]] || continue
@@ -307,6 +316,9 @@ scan_project() {
         printf '%s\n' "$rel" >>"$TMP_ROOT/scan.ignored"
         continue
       fi
+      case "$rel" in
+        *$'\n'*|*$'\t'*) record_badname "$rel"; continue ;;
+      esac
       printf '%s\n' "$rel"
     done | LC_ALL=C sort -u >"$TMP_ROOT/scan.all"
 
@@ -367,13 +379,16 @@ scan_unreached() {
     -o -name .output -o -name .vercel -o -name .turbo -o -name .wrangler -o -name .venv \
     -o -name venv -o -name target -o -name coverage \) -prune \) -o \
     \( -type f -o -type l \) \
-    \( -name '.env' -o -name '.env.*' -o -name '.dev.vars' -o -name '.dev.vars.*' \) -print 2>/dev/null |
-    while IFS= read -r rel; do
+    \( -name '.env' -o -name '.env.*' -o -name '.dev.vars' -o -name '.dev.vars.*' \) -print0 2>/dev/null |
+    while IFS= read -r -d '' rel; do
       rel="${rel#"$dir"/}"
       is_env_name "${rel##*/}" || continue
       [[ -f "$dir/$rel" ]] || continue
-      grep -Fxq -- "$rel" "$TMP_ROOT/scan.all" 2>/dev/null && continue
       envora_ignored "$dir" "$rel" && continue
+      case "$rel" in
+        *$'\n'*|*$'\t'*) record_badname "$rel"; continue ;;
+      esac
+      grep -Fxq -- "$rel" "$TMP_ROOT/scan.all" 2>/dev/null && continue
       if [[ $PROJECT_IS_GIT == 1 ]] && git --literal-pathspecs -C "$dir" ls-files --error-unmatch -- "$rel" >/dev/null 2>&1; then
         continue
       fi
@@ -392,9 +407,10 @@ project_hint_flags() {
 }
 
 # Refuse when the vault entry belongs to another repository, or when it has a
-# known origin and this folder cannot show one. --as only picks the entry: it
-# does not skip this check. --force does (and save then records the new origin,
-# e.g. after the repo was renamed or moved to an organization).
+# known origin and this folder cannot show one. Going ahead anyway takes both
+# --as NAME (which entry) and --force (yes, really): --force alone only means
+# "no prompts" for restore, and --as alone only picks the entry. Save then
+# records the new origin (e.g. after the repo was renamed or moved).
 # check_origin NAME [save|restore|status|export...]
 check_origin() {
   local name="$1" cmd="${2:-save}" saved report=err flags
@@ -403,8 +419,8 @@ check_origin() {
   if [[ -n "$PROJECT_ORIGIN" ]] && same_origin "$saved" "$PROJECT_ORIGIN"; then
     return 0
   fi
-  if [[ "${ARG_FORCE:-0}" == 1 ]]; then
-    say "${C_DIM}--force: $(tildify "$PROJECT_DIR") is used as the vault entry '$name' ($saved)${C_RST}"
+  if [[ "${ARG_FORCE:-0}" == 1 && "${ARG_AS:-}" == "$name" ]]; then
+    say "${C_DIM}--as $name --force: $(tildify "$PROJECT_DIR") is used as the vault entry '$name' ($saved)${C_RST}"
     return 0
   fi
   [[ "$cmd" == status ]] && report=warn
@@ -424,6 +440,9 @@ check_origin() {
     status) ;;
     *) say "  if it really is the same project: ev $cmd$flags --as $name --force" ;;
   esac
+  if [[ "${ARG_FORCE:-0}" == 1 && "$cmd" != status ]]; then
+    say "  (--force alone does not choose the entry: name it with --as $name)"
+  fi
   return 1
 }
 

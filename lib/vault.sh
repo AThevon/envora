@@ -149,8 +149,56 @@ vault_stage_managed() {
   vgit add -A -f -- "${staged[@]}" 2>"$TMP_ROOT/git.err"
 }
 
-# Leave no half-finished git operation behind; commit stray envora changes
-# (an interrupted save), but only encrypted files this machine can decrypt.
+# Files a write command (save, import) is rewriting in the vault, listed in
+# the git dir before they change: if the command is interrupted (Ctrl-C, a
+# killed hook), they are put back as committed instead of being committed
+# half done by the next command.
+VAULT_INFLIGHT=0
+vault_inflight_file() {
+  local gd
+  gd="$(vgit rev-parse --absolute-git-dir 2>/dev/null)" || return 1
+  printf '%s/envora-inflight' "$gd"
+}
+
+vault_inflight_add() {
+  local f
+  f="$(vault_inflight_file)" || return 0
+  printf '%s\n' "$1" >>"$f"
+  VAULT_INFLIGHT=1
+}
+
+vault_inflight_done() {
+  local f
+  VAULT_INFLIGHT=0
+  f="$(vault_inflight_file)" || return 0
+  rm -f "$f"
+}
+
+# Put back the files an unfinished write left. Prints how many.
+vault_inflight_revert() {
+  local f p n=0
+  VAULT_INFLIGHT=0
+  f="$(vault_inflight_file)" || return 0
+  [[ -f "$f" ]] || return 0
+  while IFS= read -r p; do
+    [[ -z "$p" || "$p" == /* ]] && continue
+    if vgit cat-file -e "HEAD:$p" 2>/dev/null; then
+      vgit checkout -q HEAD -- "$p" >/dev/null 2>&1 || continue
+    else
+      vgit rm -q --cached -- "$p" >/dev/null 2>&1 || true
+      rm -f -- "${ENVORA_VAULT:?}/$p"
+    fi
+    n=$((n + 1))
+  done <"$f"
+  rm -f "$f"
+  printf '%s' "$n"
+}
+
+# Leave no half-finished git operation behind:
+#   - an interrupted save / import is undone (see vault_inflight_add)
+#   - vault files deleted by hand are put back (only ev forget removes entries)
+#   - other envora changes (an interrupted rotate or forget) are committed,
+#     but only encrypted files this machine can decrypt
 vault_repair() {
   local gd
   gd="$(vgit rev-parse --absolute-git-dir 2>/dev/null)" || return 1
@@ -163,9 +211,27 @@ vault_repair() {
     vgit merge --abort >/dev/null 2>&1 || true
   fi
   find "$ENVORA_VAULT" -name '*.envora-*' -type f ! -path '*/.git/*' -exec rm -f {} + 2>/dev/null || true
+  local n
+  n="$(vault_inflight_revert)"
+  if [[ "${n:-0}" -gt 0 ]]; then
+    warn "an interrupted save left $(plural "$n" file) half written in the vault: put back as committed (nothing of it was published)"
+  fi
+  [[ -n "$(vgit status --porcelain --untracked-files=all 2>/dev/null)" ]] || return 0
+  local p dels=()
+  while IFS= read -r p; do
+    [[ -n "$p" ]] && is_managed_path "$p" && dels[${#dels[@]}]="$p"
+  done < <(vgit ls-files -z --deleted 2>/dev/null | nul_lines)
+  if [[ ${#dels[@]} -gt 0 ]]; then
+    if vgit checkout -q -- "${dels[@]}" 2>"$TMP_ROOT/git.err"; then
+      warn "$(short_list 3 "${dels[@]}") deleted from the vault folder: put back (to remove a project or a file from the vault: ev forget NAME [FILE])"
+    else
+      err "files were deleted from the vault folder and cannot be put back: $(head -n 1 "$TMP_ROOT/git.err")"
+      say "  run: git -C $(tildify "$ENVORA_VAULT") checkout -- .   (or ev forget to remove them on purpose)"
+      return 1
+    fi
+  fi
   [[ -n "$(vgit status --porcelain --untracked-files=all 2>/dev/null)" ]] || return 0
   vault_identity
-  local p
   vault_stage_managed || {
     err "cannot record the uncommitted changes of the vault: $(head -n 1 "$TMP_ROOT/git.err")"
     return 1
@@ -306,6 +372,34 @@ vault_pull() {
     VAULT_GIT_OP=""
   fi
   SYNC_PULLED="$behind"
+  vault_fixup_old_key
+  return 0
+}
+
+# Files another machine saved with the previous key after a rotation here
+# (offline, or before it imported the new key): re-encrypted for the current
+# key, so machines that only have the new key can read them. Only when this
+# key is the vault's key (.recipient).
+vault_fixup_old_key() {
+  [[ -n "${KEY_PUB:-}" ]] || return 0
+  local rec
+  rec="$(vault_recipient)" || return 0
+  [[ "$rec" == "$KEY_PUB" ]] || return 0
+  rotate_fixup
+  local fixed=() bad=() p
+  while IFS= read -r p; do [[ -n "$p" ]] && fixed[${#fixed[@]}]="$p"; done <<<"$FIXED"
+  while IFS= read -r p; do [[ -n "$p" ]] && bad[${#bad[@]}]="$p"; done <<<"$UNREADABLE"
+  if [[ ${#fixed[@]} -gt 0 ]]; then
+    warn "re-encrypted for your current key $(plural ${#fixed[@]} file) saved with the previous key: $(short_list 3 "${fixed[@]}")"
+    if vault_commit "rotate: re-encrypt files saved with the previous key ($(short_list 3 "${fixed[@]}"))" "${fixed[@]}" >/dev/null &&
+      [[ "${NO_SYNC:-0}" != 1 ]] && vault_has_remote; then
+      # Best effort: the next write pushes it otherwise.
+      vgit push -q origin HEAD >/dev/null 2>&1 || true
+    fi
+  fi
+  if [[ ${#bad[@]} -gt 0 ]]; then
+    warn "$(plural ${#bad[@]} file) of the vault open with none of your keys: $(short_list 3 "${bad[@]}") (run ev doctor)"
+  fi
   return 0
 }
 
@@ -316,22 +410,48 @@ vault_pull() {
 # changed it does the most recently committed version win; the other one
 # stays in git history and the differing keys are listed.
 vault_merge_resolve() {
-  local up="$1" p resolved=()
-  vgit merge --no-ff --no-commit -q "$up" >"$TMP_ROOT/merge.out" 2>&1 || true
+  local up="$1" p resolved=() merge_rc=0 gd
+  gd="$(vgit rev-parse --absolute-git-dir)"
+  vgit merge --no-ff --no-commit -q "$up" >"$TMP_ROOT/merge.out" 2>&1 || merge_rc=$?
   local conflicts
   conflicts="$(vgit diff --name-only -z --diff-filter=U 2>/dev/null | nul_lines)"
   if [[ -z "$conflicts" ]]; then
-    if [[ -f "$(vgit rev-parse --absolute-git-dir)/MERGE_HEAD" ]]; then
+    if [[ -f "$gd/MERGE_HEAD" ]]; then
+      vault_merge_keep_origins "$up"
       vgit commit -q -m "sync: merge changes from another machine" 2>"$TMP_ROOT/git.err" || {
         vgit merge --abort >/dev/null 2>&1 || true
         err "cannot merge the vault: $(head -n 1 "$TMP_ROOT/git.err")"
         return 1
       }
+      return 0
+    fi
+    if [[ $merge_rc -ne 0 ]]; then
+      vault_merge_failed
+      return 1
     fi
     return 0
   fi
+  # Entries claimed by two repositories first: nothing else is resolved then.
+  while IFS= read -r p; do
+    case "$p" in
+      */*/.origin) ;;
+      */.origin)
+        vault_resolve_origin "$up" "$p" || {
+          vgit merge --abort >/dev/null 2>&1 || true
+          return 1
+        }
+        resolved[${#resolved[@]}]="$p"
+        ;;
+    esac
+  done <<EOF
+$conflicts
+EOF
   while IFS= read -r p; do
     [[ -z "$p" ]] && continue
+    case "$p" in
+      */*/.origin) ;;
+      */.origin) continue ;;
+    esac
     case "$p" in
       .recipient)
         vgit merge --abort >/dev/null 2>&1 || true
@@ -358,12 +478,73 @@ EOF
     err "could not resolve the vault conflict automatically; the vault is unchanged"
     return 1
   fi
+  vault_merge_keep_origins "$up"
   vgit commit -q -m "sync: merge, conflicts resolved ($(short_list 3 "${resolved[@]}"))" 2>"$TMP_ROOT/git.err" || {
     vgit merge --abort >/dev/null 2>&1 || true
     err "cannot commit the vault merge: $(head -n 1 "$TMP_ROOT/git.err")"
     return 1
   }
   return 0
+}
+
+# git merge stopped without a conflict to resolve: say why, never pretend the
+# vault is up to date.
+vault_merge_failed() {
+  local first files
+  vgit merge --abort >/dev/null 2>&1 || true
+  first="$(grep -v '^ *$' "$TMP_ROOT/merge.out" | head -n 1 || true)"
+  if grep -q 'unrelated histories' "$TMP_ROOT/merge.out"; then
+    err "the local vault and its GitHub repo have unrelated histories (one of them was created separately): envora cannot merge them"
+    say "  to use the GitHub one: move $(tildify "$ENVORA_VAULT") away, run ev init (clone), then ev save in your projects"
+  elif grep -q 'untracked working tree files would be overwritten' "$TMP_ROOT/merge.out"; then
+    files="$(grep '^[[:space:]]' "$TMP_ROOT/merge.out" | sed 's/^[[:space:]]*//' | tr '\n' ' ')"
+    err "files in the vault folder that envora does not manage block the sync: ${files% }"
+    say "  move them out of $(tildify "$ENVORA_VAULT"), then run ev sync"
+  else
+    err "cannot bring in the changes from GitHub: ${first:-git merge failed}"
+    say "  the vault is unchanged; run ev doctor"
+  fi
+  say "  until then, this machine's vault is NOT up to date with GitHub"
+}
+
+# A conflict on <project>/.origin: both machines created the same entry.
+# Same repository (spelled differently): either one. Two different
+# repositories with the same name: never merged into one entry.
+vault_resolve_origin() {
+  local up="$1" p="$2" o_ours o_theirs entry n
+  entry="${p%/.origin}"
+  o_ours="$(vgit show ":2:$p" 2>/dev/null | head -n 1 || true)"
+  o_theirs="$(vgit show ":3:$p" 2>/dev/null | head -n 1 || true)"
+  if [[ -z "$o_theirs" ]]; then
+    vgit checkout -q --ours -- "$p" && vgit add -f -- "$p"
+    return
+  fi
+  if [[ -z "$o_ours" ]] || same_origin "$o_ours" "$o_theirs"; then
+    vgit checkout -q --theirs -- "$p" && vgit add -f -- "$p"
+    return
+  fi
+  n="$(vgit rev-list --count "$up..HEAD" 2>/dev/null || echo 0)"
+  err "the vault entry '$entry' was saved from two different repositories: $(sanitize_origin "$o_ours") (here) and $(sanitize_origin "$o_theirs") (another machine)"
+  say "  nothing was merged: this machine keeps its $(plural "$n" "vault commit") unpushed."
+  say "  to save this project under another name (its env files are still in its folder):"
+  say "    git -C $(tildify "$ENVORA_VAULT") reset --hard $up   (drops this machine's unpushed vault commits)"
+  say "    ev save --as <other-name>   (in the project; then ev save again in any other project saved offline)"
+  return 1
+}
+
+# A merge can drop <project>/.origin while keeping its files (one machine
+# forgot the entry, the other saved it again): the entry keeps its origin.
+vault_merge_keep_origins() {
+  local up="$1" d
+  while IFS= read -r d; do
+    [[ -z "$d" ]] && continue
+    vgit cat-file -e ":$d/.origin" 2>/dev/null && continue
+    if vgit cat-file -e "HEAD:$d/.origin" 2>/dev/null; then
+      vgit checkout -q HEAD -- "$d/.origin" 2>/dev/null || true
+    elif vgit cat-file -e "$up:$d/.origin" 2>/dev/null; then
+      vgit checkout -q "$up" -- "$d/.origin" 2>/dev/null || true
+    fi
+  done < <(vgit ls-files -z 2>/dev/null | nul_lines | grep '\.age$' | awk -F/ 'NF > 1 { print $1 }' | LC_ALL=C sort -u)
 }
 
 # Plaintext of a conflict stage (1 ancestor, 2 this machine, 3 the other one),
@@ -449,13 +630,30 @@ vault_commit() {
   return 0
 }
 
+# True when the commits not on GitHub only record the vault's public key.
+vault_unpushed_meta_only() {
+  local up paths
+  if up="$(vault_upstream)"; then
+    paths="$(vgit diff --name-only "$up" HEAD 2>/dev/null)"
+  else
+    paths="$(vgit ls-tree -r --name-only HEAD 2>/dev/null)"
+  fi
+  [[ -n "$paths" ]] || return 1
+  ! printf '%s\n' "$paths" | grep -vxE '\.recipient|\.gitattributes' | grep -q .
+}
+
 # Push local vault commits. Returns 0 (pushed or nothing to push) or 3.
+# A push rejected because another machine pushed first is integrated and
+# retried, a few times after a short random pause (hooks may save on several
+# machines at once). A network error is not retried.
 vault_push() {
   SYNC_PUSHED=0
   local ab ahead
   ab="$(vault_ahead_behind)"
   ahead="${ab% *}"
   [[ "${ahead:-0}" -gt 0 ]] || return 0
+  local meta=0 first_ahead="$ahead"
+  vault_unpushed_meta_only && meta=1
   if [[ "${NO_SYNC:-0}" == 1 ]]; then
     warn "vault not pushed to GitHub (--no-sync): $(plural "$ahead" commit) only on this machine"
     return 3
@@ -464,28 +662,57 @@ vault_push() {
     warn "the vault has no remote: $(plural "$ahead" commit) only on this machine"
     return 3
   fi
-  local try=1
+  local try=1 why=net
   while true; do
     if vgit push -q -u origin HEAD 2>"$TMP_ROOT/push.err"; then
       SYNC_PUSHED="$ahead"
       return 0
     fi
-    [[ $try -ge 2 ]] && break
-    try=$((try + 1))
-    # Rejected because the remote moved: integrate and retry once.
-    if vgit fetch -q origin 2>/dev/null; then
-      vault_pull || break
-      ab="$(vault_ahead_behind)"
-      ahead="${ab% *}"
-    else
+    # Not even an answer from GitHub: offline, no retry.
+    if ! grep -q 'rejected' "$TMP_ROOT/push.err"; then
+      why=net
       break
     fi
+    why=race
+    [[ $try -ge 5 ]] && break
+    try=$((try + 1))
+    if ! vgit fetch -q origin 2>/dev/null; then
+      why=net
+      break
+    fi
+    ab="$(vault_ahead_behind)"
+    # Refused although nobody pushed meanwhile (a protected branch, a hook):
+    # retrying would not help.
+    if [[ "${ab#* }" -eq 0 ]] && ! grep -q 'cannot lock ref' "$TMP_ROOT/push.err"; then
+      why=refused
+      break
+    fi
+    [[ $try -gt 2 ]] && { sleep "0.$((RANDOM % 7 + 2))" 2>/dev/null || sleep 1; }
+    if ! vault_pull; then
+      why=merge
+      break
+    fi
+    ab="$(vault_ahead_behind)"
+    ahead="${ab% *}"
+    if [[ "${ahead:-0}" -eq 0 ]]; then
+      SYNC_PUSHED="$first_ahead"
+      return 0
+    fi
   done
+  if [[ $meta == 1 ]]; then
+    warn "the vault public key (.recipient) is recorded on this machine but not on GitHub yet: the next ev sync sends it"
+    return 3
+  fi
   err "PUSH FAILED: the vault was saved on this machine but NOT sent to GitHub"
-  if [[ "${QUIET:-0}" != 1 ]]; then
+  if [[ "${QUIET:-0}" != 1 && $why != merge ]]; then
     sed 's/^/  git: /' "$TMP_ROOT/push.err" | grep -v '^  git: *$' | head -n 5 >&2 || true
   fi
-  say "  run 'ev sync' when you are back online"
+  case "$why" in
+    net) say "  run 'ev sync' when you are back online" ;;
+    race) say "  other machines kept pushing at the same time: run 'ev sync' in a moment" ;;
+    refused) say "  GitHub refused it (see above): fix that, then run 'ev sync'" ;;
+    merge) say "  the changes already on GitHub could not be brought in (see above)" ;;
+  esac
   return 3
 }
 

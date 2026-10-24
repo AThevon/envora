@@ -52,15 +52,30 @@ base_record() {
 #   changed   edited here, the vault did not move since this folder synced it
 #   stale     the vault has a newer version and this copy was not edited since
 #   conflict  edited here AND a newer version in the vault (another machine),
-#             or the version saved from here lost a sync conflict
+#             or the version saved from here lost a sync conflict, or this
+#             folder never synced the file and its copy matches no version the
+#             vault ever had (a worktree, a copy made by hand, envora 0.x)
 # The base version is read back from git history and decrypted in a pipe
 # (with old keys too after a rotation); only checksums are compared, so no
 # plaintext is ever stored, even if the process is killed.
 classify_change() {
   local rel="$1" b s_base s_vault s_here
   b="$(base_blob "$rel")"
-  if [[ -z "$b" || "$b" == "$(vault_blob "$rel")" ]]; then
+  if [[ -n "$b" && "$b" == "$(vault_blob "$rel")" ]]; then
     printf 'changed'
+    return 0
+  fi
+  if [[ -z "$b" ]]; then
+    # No record of this folder syncing the file: a copy identical to an
+    # older vault version was not edited since (stale); anything else is
+    # treated as edited on both sides once the vault has history for it.
+    if [[ -n "$(history_base "$rel")" ]]; then
+      printf 'stale'
+    elif [[ -n "$(vgit log -1 --format=%h -- "$PROJECT_NAME/$rel.age" 2>/dev/null || true)" ]]; then
+      printf 'conflict'
+    else
+      printf 'changed'
+    fi
     return 0
   fi
   if is_lost_blob "$b"; then
@@ -83,20 +98,46 @@ classify_change() {
   fi
 }
 
-# "commit abc1234, 2 hours ago" for the last vault change of REL
+# Blob of the most recent committed vault version of REL whose content is
+# exactly the project copy (last 30 versions), or nothing.
+history_base() {
+  local rel="$1" s_here c s
+  s_here="$(cksum <"$PROJECT_DIR/$rel" 2>/dev/null)" || return 0
+  [[ ${#ID_ARGS[@]} -gt 0 ]] || load_identities
+  while IFS= read -r c; do
+    [[ -z "$c" ]] && continue
+    if s="$(vgit cat-file blob "$c:$PROJECT_NAME/$rel.age" 2>/dev/null | age -d "${ID_ARGS[@]}" 2>/dev/null | cksum)" &&
+      [[ "$s" == "$s_here" ]]; then
+      vgit rev-parse -q --verify "$c:$PROJECT_NAME/$rel.age" 2>/dev/null || true
+      return 0
+    fi
+  done < <(vgit log -n 30 --format=%H -- "$PROJECT_NAME/$rel.age" 2>/dev/null)
+  return 0
+}
+
+# True when this folder has a record of syncing REL with the vault.
+has_base() {
+  [[ -n "$(base_blob "$1")" ]]
+}
+
+# "commit abc1234, 2 hours ago" for the last vault change of REL that was a
+# real save (re-encryptions by ev rotate are skipped).
 vault_file_commit() {
   local c
-  c="$(vgit log -1 --format='%h, %cr' -- "$PROJECT_NAME/$1.age" 2>/dev/null || true)"
+  c="$(vgit log --format='%h, %cr%x09%s' -- "$PROJECT_NAME/$1.age" 2>/dev/null | awk -F '\t' '$2 !~ /^rotate:/ { print $1; exit }' || true)"
   if [[ -n "$c" ]]; then printf 'commit %s' "$c"; else printf 'not committed yet'; fi
 }
 
 # Compute what "save" would do for PROJECT_NAME / PROJECT_DIR.
 # Writes $TMP_ROOT/plan.save: "<status>\t<relpath>", status in
 #   new | changed | stale | conflict | same | tracked | vaultonly
+#   unreached (an env file the scan does not reach: deeper than 4 levels, or
+#   in build/ or dist/) | badname (a path with a newline or tab, shown escaped)
 # (see classify_change for changed / stale / conflict)
 save_plan() {
   local base="$ENVORA_VAULT/$PROJECT_NAME" rel plan="$TMP_ROOT/plan.save"
   scan_project "$PROJECT_DIR"
+  scan_unreached "$PROJECT_DIR"
   : >"$plan"
   while IFS= read -r rel; do
     [[ -z "$rel" ]] && continue
@@ -118,8 +159,24 @@ save_plan() {
   while IFS= read -r rel; do
     [[ -z "$rel" ]] && continue
     grep -Fxq -- "$rel" "$TMP_ROOT/scan.all" && continue
+    grep -Fxq -- "$rel" "$TMP_ROOT/scan.unreached" && continue
     printf 'vaultonly\t%s\n' "$rel" >>"$plan"
   done <"$TMP_ROOT/vault.files"
+  while IFS= read -r rel; do
+    [[ -n "$rel" ]] && printf 'unreached\t%s\n' "$rel" >>"$plan"
+  done <"$TMP_ROOT/scan.unreached"
+  while IFS= read -r rel; do
+    [[ -n "$rel" ]] && printf 'badname\t%s\n' "$rel" >>"$plan"
+  done <"$TMP_ROOT/scan.badnames"
+  return 0
+}
+
+# Why a file is not reached by the scan (one short reason).
+unreached_reason() {
+  case "/$1" in
+    */build/*|*/dist/*) printf 'inside build/ or dist/' ;;
+    *) printf 'deeper than %s levels' "$SCAN_DEPTH" ;;
+  esac
 }
 
 # Compute what "restore" would do. Writes $TMP_ROOT/plan.restore:
@@ -132,7 +189,7 @@ restore_plan() {
   vault_project_files "$PROJECT_NAME" >"$TMP_ROOT/vault.files"
   while IFS= read -r rel; do
     [[ -z "$rel" ]] && continue
-    if ! valid_relpath "$rel"; then
+    if ! restorable_relpath "$rel"; then
       printf 'invalid\t%s\n' "$rel" >>"$plan"
       continue
     fi
@@ -149,6 +206,17 @@ restore_plan() {
       printf 'differs\t%s\n' "$rel" >>"$plan"
     fi
   done <"$TMP_ROOT/vault.files"
+}
+
+# A vault path restore may write: an env file name, a safe relative path,
+# and nowhere save would never look (.git, node_modules, build...).
+restorable_relpath() {
+  local d
+  valid_relpath "$1" || return 1
+  for d in $PRUNE_DIRS; do
+    case "/$1" in */"$d"/*) return 1 ;; esac
+  done
+  return 0
 }
 
 plan_count() {
@@ -197,10 +265,12 @@ is_legacy_vercel_copy() {
   [[ "$first" == "# Created by Vercel CLI"* ]]
 }
 
-# Parse "--as NAME" and a single positional NAME. Sets POS_NAME.
+# parse_name_args CMD "ALLOWED FLAGS" ARGS... : "--as NAME" and a single
+# positional NAME, plus the flags this command accepts (--force, --values).
+# Sets POS_NAME.
 parse_name_args() {
-  local cmd="$1"
-  shift
+  local cmd="$1" allowed=" $2 "
+  shift 2
   POS_NAME=""
   while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -210,11 +280,18 @@ parse_name_args() {
         shift
         ;;
       --as=*) ARG_AS="${1#--as=}" ;;
-      --force) ARG_FORCE=1 ;;
-      --values) ARG_VALUES=1 ;;
       -*)
-        err "unknown option for $cmd: $1 (see: ev help $cmd)"
-        return 1
+        case "$allowed" in
+          *" $1 "*) ;;
+          *)
+            err "unknown option for $cmd: $1 (see: ev help $cmd)"
+            return 1
+            ;;
+        esac
+        case "$1" in
+          --force) ARG_FORCE=1 ;;
+          --values) ARG_VALUES=1 ;;
+        esac
         ;;
       *)
         if [[ -n "$POS_NAME" ]]; then
@@ -234,8 +311,20 @@ parse_name_args() {
 
 # --- save: project -> vault --------------------------------------------------
 
+# Encrypt REL of the project into the vault (listed as in flight first, see
+# vault_inflight_add). Records the blob in SAVED / SAVED_BLOBS.
+SAVED=() SAVED_BLOBS=()
+save_one() {
+  local rel="$1"
+  vault_inflight_add "$PROJECT_NAME/$rel.age"
+  encrypt_file "$PROJECT_DIR/$rel" "$ENVORA_VAULT/$PROJECT_NAME/$rel.age" || return 1
+  SAVED[${#SAVED[@]}]="$rel"
+  SAVED_BLOBS[${#SAVED_BLOBS[@]}]="$(vault_blob "$rel")"
+  base_record "$rel"
+}
+
 cmd_save() {
-  parse_name_args save "$@" || return 1
+  parse_name_args save "--force" "$@" || return 1
   vault_ready || return 1
   require_key || return 1
   vault_pull || return 1
@@ -244,8 +333,9 @@ cmd_save() {
   check_origin "$PROJECT_NAME" save || return 1
 
   save_plan
-  local plan="$TMP_ROOT/plan.save" base="$ENVORA_VAULT/$PROJECT_NAME"
-  local rel st d saved=() saved_blobs=() failed=0 n_new=0 n_changed=0 n_skipped=0 n_stale=0
+  local plan="$TMP_ROOT/plan.save"
+  local rel st d failed=0 n_new=0 n_changed=0 n_skipped=0 n_stale=0
+  SAVED=() SAVED_BLOBS=()
   : >"$TMP_ROOT/save.decisions"
   save_ask_conflicts || return 1
 
@@ -254,14 +344,22 @@ cmd_save() {
       same) base_record "$rel" ;;
       stale)
         n_stale=$((n_stale + 1))
-        step "$rel  ${C_DIM}unchanged here since its last save/restore, the vault has a newer version ($(vault_file_commit "$rel")): kept it (ev restore brings it here)${C_RST}"
+        if has_base "$rel"; then
+          step "$rel  ${C_DIM}unchanged here since its last save/restore; the vault has a newer version ($(vault_file_commit "$rel")): left the vault version in place (ev restore brings it here)${C_RST}"
+        else
+          step "$rel  ${C_DIM}this copy is an older version of the vault's ($(vault_file_commit "$rel") is newer): left the vault version in place (ev restore brings it here)${C_RST}"
+        fi
         ;;
       conflict)
         d="$(save_decision "$rel")"
         case "$d" in
           keep) ;;
           moved)
-            warn "$rel: the vault copy changed again while you were answering: skipped, run ev save again"
+            if is_interactive; then
+              warn "$rel: the vault copy changed again while you were answering: skipped, run ev save again"
+            else
+              warn "$rel: the vault copy changed during the save: skipped, run ev save again"
+            fi
             n_skipped=$((n_skipped + 1))
             continue
             ;;
@@ -272,23 +370,21 @@ cmd_save() {
             ;;
         esac
         if ! is_interactive; then
-          warn "$rel: the vault had a newer version from another machine ($(vault_file_commit "$rel")): replaced by this copy ($(key_diff_line "$rel")); the other version stays in git history"
+          if has_base "$rel"; then
+            warn "$rel: the vault had a newer version from another machine ($(vault_file_commit "$rel")): replaced by this copy: $(key_diff_line "$rel"); the other version stays in git history"
+          else
+            warn "$rel: this folder never saved or restored it, and the vault holds another version ($(vault_file_commit "$rel")): replaced by this copy: $(key_diff_line "$rel"); the other version stays in git history"
+          fi
         fi
-        if encrypt_file "$PROJECT_DIR/$rel" "$base/$rel.age"; then
-          saved[${#saved[@]}]="$rel"
-          saved_blobs[${#saved_blobs[@]}]="$(vault_blob "$rel")"
+        if save_one "$rel"; then
           n_changed=$((n_changed + 1))
-          base_record "$rel"
-          step "$rel  ${C_DIM}changed → vault (replaced the other machine's version)${C_RST}"
+          step "$rel  ${C_DIM}changed → vault (replaced the vault's other version)${C_RST}"
         else
           failed=$((failed + 1))
         fi
         ;;
       new|changed)
-        if encrypt_file "$PROJECT_DIR/$rel" "$base/$rel.age"; then
-          saved[${#saved[@]}]="$rel"
-          saved_blobs[${#saved_blobs[@]}]="$(vault_blob "$rel")"
-          base_record "$rel"
+        if save_one "$rel"; then
           if [[ "$st" == new ]]; then
             n_new=$((n_new + 1))
             step "$rel  ${C_DIM}new → vault${C_RST}"
@@ -321,13 +417,15 @@ cmd_save() {
   local n_files commit_rc=1
   n_files="$(vault_project_files "$PROJECT_NAME" | grep -c . || true)"
   if [[ "$n_files" -gt 0 ]]; then
+    vault_inflight_add "$PROJECT_NAME/.origin"
     save_origin_file
     vault_gitattributes
     local msg="save: $PROJECT_NAME"
-    [[ ${#saved[@]} -gt 0 ]] && msg="save: $PROJECT_NAME ($(short_list 5 "${saved[@]}"))"
+    [[ ${#SAVED[@]} -gt 0 ]] && msg="save: $PROJECT_NAME ($(short_list 5 "${SAVED[@]}"))"
     commit_rc=0
     vault_commit "$msg" "$PROJECT_NAME" .recipient .gitattributes || commit_rc=$?
     [[ $commit_rc == 2 ]] && return 1
+    vault_inflight_done
     record_project_dir
   else
     vault_commit "envora: record the vault public key" .recipient >/dev/null || true
@@ -344,9 +442,9 @@ cmd_save() {
   # push: the retry merged it, and its version may have won.
   local i lost=()
   i=0
-  while [[ $i -lt ${#saved[@]} ]]; do
-    if [[ "$(vault_blob "${saved[$i]}")" != "${saved_blobs[$i]}" ]]; then
-      lost[${#lost[@]}]="${saved[$i]}"
+  while [[ $i -lt ${#SAVED[@]} ]]; do
+    if [[ "$(vault_blob "${SAVED[$i]}")" != "${SAVED_BLOBS[$i]}" ]]; then
+      lost[${#lost[@]}]="${SAVED[$i]}"
     fi
     i=$((i + 1))
   done
@@ -355,41 +453,61 @@ cmd_save() {
     say "  run 'ev save' again to put this folder's version back (you will be asked)"
     return 1
   fi
-  local total=$((n_new + n_changed))
-  if [[ $total -gt 0 ]]; then
-    result "$push_rc" "$(plural "$total" file) saved to the vault ($PROJECT_NAME)$(push_suffix "$push_rc")"
-  elif [[ "$n_files" -eq 0 ]]; then
-    say "nothing to save: no env files found in $(tildify "$PROJECT_DIR")"
-  elif [[ $n_skipped -eq 0 && $n_stale -gt 0 ]]; then
-    result "$push_rc" "nothing new to save: the vault already has newer versions$(push_suffix "$push_rc")"
-  elif [[ $n_skipped -eq 0 ]]; then
-    result "$push_rc" "nothing changed: the vault already has these $(plural "$n_files" file)$(push_suffix "$push_rc")"
-  fi
 
   # Exit 0 promises that every env file of the folder is in the vault.
-  scan_unreached "$PROJECT_DIR"
-  if [[ -s "$TMP_ROOT/scan.unreached" ]]; then
-    while IFS= read -r rel; do
-      warn "NOT saved: $rel (envora scans 4 levels deep and skips build/ and dist/)"
-    done <"$TMP_ROOT/scan.unreached"
-    err "$(plural "$(grep -c . "$TMP_ROOT/scan.unreached")" "env file") of this folder NOT in the vault: do not delete it yet. Move it up, delete it, or list it in .envoraignore to skip it"
+  local unreached=() badnames=() missing=0
+  while IFS= read -r rel; do [[ -n "$rel" ]] && unreached[${#unreached[@]}]="$rel"; done <<<"$(plan_list "$plan" unreached)"
+  while IFS= read -r rel; do [[ -n "$rel" ]] && badnames[${#badnames[@]}]="$rel"; done <<<"$(plan_list "$plan" badname)"
+  missing=$((${#unreached[@]} + ${#badnames[@]}))
+  local note=""
+  [[ $missing -gt 0 ]] && note=" · $(plural "$missing" "env file") NOT in the vault, see below"
+  local total=$((n_new + n_changed)) summary_rc="$push_rc"
+  [[ $missing -gt 0 ]] && summary_rc=1
+  if [[ $total -gt 0 ]]; then
+    result "$summary_rc" "$(plural "$total" file) saved to the vault ($PROJECT_NAME)$(push_suffix "$push_rc")$note"
+  elif [[ "$n_files" -eq 0 ]]; then
+    if [[ $missing -gt 0 ]]; then
+      partial "nothing saved$note"
+    else
+      say "nothing to save: no env files found in $(tildify "$PROJECT_DIR")"
+    fi
+  elif [[ $n_skipped -eq 0 && $n_stale -gt 0 ]]; then
+    result "$summary_rc" "nothing new to save: the vault already has newer versions$(push_suffix "$push_rc")$note"
+  elif [[ $n_skipped -eq 0 ]]; then
+    local these="these $n_files files"
+    [[ "$n_files" == 1 ]] && these="this file"
+    result "$summary_rc" "nothing changed: the vault already has $these$(push_suffix "$push_rc")$note"
+  fi
+
+  if [[ $missing -gt 0 ]]; then
+    for rel in ${unreached[@]+"${unreached[@]}"}; do
+      warn "NOT saved: $rel ($(unreached_reason "$rel"): envora scans $SCAN_DEPTH levels deep and skips build/ and dist/)"
+    done
+    for rel in ${badnames[@]+"${badnames[@]}"}; do
+      warn "NOT saved: $rel (a newline or tab in its path: rename it)"
+    done
+    local them="it" these_f="this file"
+    [[ $missing -gt 1 ]] && them="them" these_f="these files"
+    err "$(plural "$missing" "env file") of this folder NOT in the vault: do not delete the folder yet. Move $them up, rename or delete $them, or list $these_f in .envoraignore to skip $them"
     return 1
   fi
   if [[ $n_skipped -gt 0 ]]; then
     partial "$(plural "$n_skipped" file) not saved (the vault keeps its newer version)$(push_suffix "$push_rc")"
     return 1
   fi
+  # A folder with no env files of its own: nothing of it waits for GitHub.
+  [[ "$n_files" -eq 0 ]] && return 0
   return "$push_rc"
 }
 
 # Record (or fix) vault/<project>/.origin: written when missing, replaced on
-# --force when the project now has another origin, and cleaned when an older
+# --as NAME --force when the project now has another origin, and cleaned when an older
 # envora stored credentials in it.
 save_origin_file() {
   local f="$ENVORA_VAULT/$PROJECT_NAME/.origin" cur=""
   [[ -f "$f" ]] && cur="$(head -n 1 "$f" 2>/dev/null || true)"
   if [[ -n "$PROJECT_ORIGIN" ]]; then
-    if [[ -z "$cur" ]] || { [[ "${ARG_FORCE:-0}" == 1 ]] && ! same_origin "$cur" "$PROJECT_ORIGIN"; }; then
+    if [[ -z "$cur" ]] || { [[ "${ARG_FORCE:-0}" == 1 && "${ARG_AS:-}" == "$PROJECT_NAME" ]] && ! same_origin "$cur" "$PROJECT_ORIGIN"; }; then
       [[ -n "$cur" ]] && say "${C_DIM}origin of $PROJECT_NAME in the vault: now $PROJECT_ORIGIN (was $(sanitize_origin "$cur"))${C_RST}"
       printf '%s\n' "$PROJECT_ORIGIN" >"$f"
       return 0
@@ -417,8 +535,14 @@ save_ask_conflicts() {
   vault_release
   while IFS= read -r rel; do
     say ""
-    say "${C_WARN}!${C_RST} ${C_BOLD}$rel${C_RST} changed here AND in the vault since this machine last saved or restored it"
-    say "    vault version: $(vault_file_commit "$rel") (another machine)"
+    if has_base "$rel"; then
+      say "${C_WARN}!${C_RST} ${C_BOLD}$rel${C_RST} changed here AND in the vault since this folder last saved or restored it"
+      say "    vault version: $(vault_file_commit "$rel") (another machine or folder)"
+    else
+      say "${C_WARN}!${C_RST} ${C_BOLD}$rel${C_RST} differs from the vault, and this folder never saved or restored it"
+      say "    ${C_DIM}(a worktree, a copy made by hand, or a file from envora 0.x: envora cannot tell which one is newer)${C_RST}"
+      say "    vault version: $(vault_file_commit "$rel")"
+    fi
     say "    ${C_DIM}this copy vs the vault: $(key_diff_line "$rel")${C_RST}"
     d=skip
     c="$(choose "What should happen to $rel?" \
@@ -436,7 +560,8 @@ save_ask_conflicts() {
 # save_decision REL -> keep | skip | moved (vault changed since the question)
 save_decision() {
   local rel="$1" line blob d
-  line="$(awk -F '\t' -v r="$rel" '$1 == r' "$TMP_ROOT/save.decisions" | tail -n 1)"
+  # The path goes through the environment: awk -v would expand backslashes.
+  line="$(R="$rel" awk -F '\t' '$1 == ENVIRON["R"]' "$TMP_ROOT/save.decisions" | tail -n 1)"
   [[ -n "$line" ]] || { printf 'moved'; return 0; }
   blob="$(printf '%s' "$line" | cut -f2)"
   d="$(printf '%s' "$line" | cut -f3)"
@@ -476,21 +601,36 @@ EOF
 
 # Atomically write the vault version of REL into the project.
 write_restored() {
-  local rel="$1" target="$PROJECT_DIR/$1" dir probe phys tmp
+  local rel="$1" target="$PROJECT_DIR/$1" dir probe phys tmp link=0
   if [[ -L "$target" ]]; then
     target="$(resolve_symlink "$target")"
-  else
-    probe="$(dirname "$target")"
-    while [[ ! -d "$probe" ]]; do probe="$(dirname "$probe")"; done
-    phys="$(abs_dir "$probe")"
-    case "$phys/" in
-      "$PROJECT_DIR"/*) ;;
-      *)
-        err "refusing to restore $rel: it would land outside $PROJECT_DIR"
-        return 1
-        ;;
-    esac
+    link=1
   fi
+  probe="$(dirname "$target")"
+  while [[ ! -d "$probe" ]]; do probe="$(dirname "$probe")"; done
+  phys="$(abs_dir "$probe")"
+  case "$phys/" in
+    "$PROJECT_DIR"/*) ;;
+    *)
+      if [[ $link == 0 ]]; then
+        err "refusing to restore $rel: it would land outside $(tildify "$PROJECT_DIR")"
+        return 1
+      fi
+      # A link you made to a file outside the project: only on an explicit yes.
+      local yes=1
+      if is_interactive; then
+        vault_release
+        confirm "$rel is a link to $(tildify "$target"), outside the project: write the vault version there?" no || yes=0
+        vault_reacquire || return 1
+      else
+        yes=0
+      fi
+      if [[ $yes == 0 ]]; then
+        err "refusing to restore $rel: it is a link to $(tildify "$target"), outside the project (restore it in a terminal to confirm, or replace the link)"
+        return 1
+      fi
+      ;;
+  esac
   dir="$(dirname "$target")"
   mkdir -p "$dir" || { err "cannot create $dir"; return 1; }
   # Same prefix as the target (.env.envora-XXXX), so the project's .env*
@@ -510,7 +650,7 @@ write_restored() {
 
 cmd_restore() {
   ARG_FORCE=0
-  parse_name_args restore "$@" || return 1
+  parse_name_args restore "--force" "$@" || return 1
   vault_ready || return 1
   require_key || return 1
   vault_pull || return 1
@@ -621,7 +761,7 @@ cmd_restore() {
 
 cmd_status() {
   ARG_VALUES=0
-  parse_name_args status "$@" || return 1
+  parse_name_args status "--values" "$@" || return 1
   vault_ready || return 1
   require_key || return 1
   vault_pull || return 1
@@ -649,10 +789,18 @@ status_report() {
       same) line="${C_ACC}✓${C_RST} $(printf "%-${w}s" "$rel")  in sync" ;;
       changed) line="${C_WARN}~${C_RST} $(printf "%-${w}s" "$rel")  changed here: $(key_diff_line "$rel")" ;;
       stale) line="${C_WARN}↓${C_RST} $(printf "%-${w}s" "$rel")  newer in the vault ($(vault_file_commit "$rel"), saved from another machine or folder); this copy is unchanged since its last save/restore: ev restore" ;;
-      conflict) line="${C_ERR}!${C_RST} $(printf "%-${w}s" "$rel")  changed here AND in the vault ($(vault_file_commit "$rel"), saved from another machine or folder): $(key_diff_line "$rel")" ;;
+      conflict)
+        if has_base "$rel"; then
+          line="${C_ERR}!${C_RST} $(printf "%-${w}s" "$rel")  changed here AND in the vault ($(vault_file_commit "$rel"), saved from another machine or folder): $(key_diff_line "$rel")"
+        else
+          line="${C_ERR}!${C_RST} $(printf "%-${w}s" "$rel")  differs from the vault ($(vault_file_commit "$rel")) and this folder never saved or restored it: $(key_diff_line "$rel")"
+        fi
+        ;;
       new) line="${C_WARN}+${C_RST} $(printf "%-${w}s" "$rel")  only in project (not saved yet)" ;;
       vaultonly) line="${C_WARN}-${C_RST} $(printf "%-${w}s" "$rel")  only in vault (missing here)" ;;
       tracked) line="${C_DIM}· $(printf "%-${w}s" "$rel")  tracked by git, envora skips it${C_RST}" ;;
+      unreached) line="${C_ERR}!${C_RST} $(printf "%-${w}s" "$rel")  NOT reached by envora ($(unreached_reason "$rel")): move it up, or list it in .envoraignore" ;;
+      badname) line="${C_ERR}!${C_RST} $(printf "%-${w}s" "$rel")  NOT saved: a newline or tab in its path (rename it)" ;;
       *) continue ;;
     esac
     out "  $line"
@@ -712,7 +860,7 @@ status_snapshots() {
       fi
       cmp="$(printf '%s\n' "$diff" | key_diff_summary "$local_rel" "Vercel")"
       [[ "$cmp" == "same keys and values, formatting differs" ]] && cmp="same values as $local_rel"
-      [[ "$unknown" -gt 0 ]] && cmp="$cmp (Secrets not compared)"
+      [[ "$unknown" -gt 0 ]] && cmp="$cmp (values of write-only secrets not compared)"
       cmp=" · $cmp"
     fi
     out "  ▲ $rel  ${C_DIM}$(plural "$n" var)$extra$cmp${C_RST}"
@@ -877,9 +1025,13 @@ cmd_sync() {
     ab="$(vault_ahead_behind)"
     if [[ "${ab% *}" -gt 0 ]]; then
       err "offline: $(plural "${ab% *}" commit) waiting to be pushed to GitHub"
+      return 3
     fi
-    return 3
+    err "not synced: GitHub cannot be reached (nothing from this machine waits to be pushed)"
+    return 1
   fi
+  # Files another machine saved with a previous key of yours.
+  [[ "$SYNC_PULLED" -gt 0 ]] || vault_fixup_old_key
   local push_rc=0
   vault_push || push_rc=$?
   local parts=()

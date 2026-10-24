@@ -31,6 +31,7 @@ require_key() {
     err "$(tildify "$ENVORA_KEY") is not a valid age key"
     return 1
   }
+  load_identities
 }
 
 vault_recipient() {
@@ -61,19 +62,43 @@ key_matches_vault() {
   return 0
 }
 
+# A key kept as <key>.bak-* (by ev rotate or ev init --import-key) that
+# matches this vault, or nothing.
+matching_backup_key() {
+  local f
+  for f in "$ENVORA_KEY".bak-*; do
+    [[ -f "$f" && -r "$f" ]] || continue
+    if [[ -n "$VAULT_EXPECTED" ]]; then
+      [[ "$(pubkey_of "$f" 2>/dev/null || true)" == "$VAULT_EXPECTED" ]] && { printf '%s' "$f"; return 0; }
+    elif [[ -n "$VAULT_SAMPLE" ]]; then
+      age -d -i "$f" "$ENVORA_VAULT/$VAULT_SAMPLE" >/dev/null 2>&1 && { printf '%s' "$f"; return 0; }
+    fi
+  done
+  return 1
+}
+
+# recipient_mismatch_message [init]: "init" leaves out "Nothing was changed"
+# (init may have just installed a key).
 recipient_mismatch_message() {
+  local bak=""
+  bak="$(matching_backup_key || true)"
   if [[ -n "$VAULT_EXPECTED" ]]; then
-    err "this vault is encrypted for a different key than yours"
+    err "this vault is encrypted for a different key than yours (rotated elsewhere? run: ev init --import-key)"
     say "  vault expects: $(printf '%.24s' "$VAULT_EXPECTED")..."
   else
-    err "your key cannot decrypt the files already in the vault (e.g. $VAULT_SAMPLE): it is not the key this vault was made with"
+    err "your key cannot decrypt the files already in the vault (e.g. $VAULT_SAMPLE): it is not the key this vault was made with (run: ev init --import-key)"
   fi
   say "  your key:      $(printf '%.24s' "$KEY_PUB")... ($(tildify "$ENVORA_KEY"))"
-  say "  Two usual causes:"
-  say "    - the key was rotated on another machine (ev rotate): import the new key"
-  say "    - this machine generated its own key instead of importing your envora key"
-  say "  Fix: ev init --import-key   (paste the right key; the current one is kept as .bak)"
-  say "  Nothing was changed."
+  if [[ -n "$bak" ]]; then
+    say "  your previous key $(tildify "$bak") matches this vault. To put it back:"
+    say "    cp -p $(tildify "$bak") $(tildify "$ENVORA_KEY")"
+  else
+    say "  Two usual causes:"
+    say "    - the key was rotated on another machine (ev rotate): import the new key"
+    say "    - this machine generated its own key instead of importing your envora key"
+    say "  Fix: ev init --import-key   (paste the right key; the current one is kept as .bak)"
+  fi
+  [[ "${1:-}" == init ]] || say "  Nothing was changed."
 }
 
 # Check the vault is encrypted for the local key.
@@ -91,9 +116,11 @@ check_recipient() {
   return 0
 }
 
-# decrypt_to_stdout file.age
+# decrypt_stream file.age -> plaintext on stdout. Old keys kept by a
+# rotation are tried too: a file another machine saved with the previous key
+# stays readable until it is re-encrypted.
 decrypt_stream() {
-  age -d -i "$ENVORA_KEY" "$1"
+  decrypt_any "$1"
 }
 
 # Every key this machine has: the current one, then the old ones kept by

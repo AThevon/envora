@@ -523,7 +523,7 @@ t_stale_copy_never_overwrites_newer_vault() {
   expect_rc 0 status
   assert_contains "$OUT" "newer in the vault"
   expect_rc 0 save -C . --yes
-  assert_contains "$OUT" "kept it"
+  assert_contains "$OUT" "left the vault version in place"
   assert_eq "$(age -d -i "$ENVORA_KEY" "$ENVORA_VAULT/app/.env.local.age")" "TOKEN=new-rotated"
   # restore updates the stale copy without asking (backup kept)
   expect_rc 0 restore
@@ -587,7 +587,7 @@ t_restore_and_save_check_origin() {
   cd "$p"
   expect_rc 1 export cloudflare --dry-run
   assert_contains "$OUT" "--as app --force"
-  expect_rc 0 save --force --yes
+  expect_rc 0 save --as app --force --yes
   assert_eq "$(cat "$ENVORA_VAULT/app/.origin")" "git@github.com:acme/app.git"
   expect_rc 0 status -q
   assert_not_contains "$OUT" "another repository"
@@ -921,7 +921,7 @@ HOOK
   cd "$p"
   expect_rc 0 rotate --yes
   assert_file "$T/hook.done"
-  assert_contains "$OUT" "saved meanwhile by another machine"
+  assert_contains "$OUT" "re-encrypted for your current key 2 files saved with the previous key"
   all_decrypt_with_key
   rm "$ENVORA_VAULT/.git/hooks/pre-push"
   local f
@@ -1996,6 +1996,221 @@ t_killed_runs_leave_no_plaintext() {
   printf 'A=2\n' >"$p/.env"
   ENVORA_MENU_DIR="$p" "$TEST_BASH" "$EV" _preview save >/dev/null 2>&1 </dev/null
   assert_eq "$(grep -rl 'A=1' "$TMPDIR" 2>/dev/null | grep -v '\.age$' || true)" ""
+}
+
+t_copy_without_base_never_reverts_vault() {
+  local key="$T/A/home/.age/key.txt" p wt pb
+  p="$(mkproject app)"
+  printf 'X=1\n' >"$p/.env"
+  (cd "$p" && expect_rc 0 save -y -q)
+  # a worktree gets a copy of .env (the copy-env way), then the main folder moves on
+  wt="$ENVORA_PROJECTS/app-wt"
+  git -C "$p" worktree add -q "$wt" -b feat 2>/dev/null
+  cp "$p/.env" "$wt/.env"
+  printf 'X=2\nSTRIPE_KEY=new\n' >"$p/.env"
+  (cd "$p" && expect_rc 0 save -y -q)
+  expect_rc 0 save -C "$wt" -y
+  assert_contains "$OUT" "this copy is an older version of the vault's"
+  assert_contains "$(age -d -i "$key" "$ENVORA_VAULT/app/.env.age")" "STRIPE_KEY=new"
+  expect_rc 0 status -C "$wt"
+  assert_contains "$OUT" "newer in the vault"
+  # a file made by hand on another machine (or by envora 0.x): never replaces silently
+  new_machine B "$key"
+  pb="$(mkproject app)"
+  printf 'X=hand\n' >"$pb/.env"
+  expect_rc 0 status -C "$pb"
+  assert_contains "$OUT" "this folder never saved or restored it"
+  expect_rc 0 save -C "$pb" -y -q
+  assert_contains "$OUT" "ev: warning: .env: this folder never saved or restored it, and the vault holds another version (commit "
+  assert_contains "$OUT" "the other version stays in git history"
+}
+
+t_sync_homonym_repos_never_merge() {
+  local key="$T/A/home/.age/key.txt" pa pb head
+  printf 'C=1\n' >"$(mkproject common)/.env"
+  expect_rc 0 save -C "$ENVORA_PROJECTS/common" -y -q
+  pa="$(mkproject app "git@github.com:work/app.git")"
+  mkdir -p "$pa/apps/web"
+  printf 'WORK_DB=1\n' >"$pa/.env"
+  printf 'WORK_API_KEY=work-secret\n' >"$pa/apps/web/.env.local"
+  (cd "$pa" && expect_rc 3 save -y -q --no-sync)
+  new_machine B "$key"
+  pb="$(mkproject app "git@github.com:me/app.git")"
+  printf 'PERSONAL=1\n' >"$pb/.env"
+  (cd "$pb" && expect_rc 0 save -y -q)
+  use_machine A
+  head="$(git -C "$ENVORA_VAULT" rev-parse HEAD)"
+  expect_rc 1 sync
+  assert_contains "$OUT" "the vault entry 'app' was saved from two different repositories"
+  assert_contains "$OUT" "ev save --as <other-name>"
+  assert_not_contains "$OUT" "conflict on app/.env.age"
+  assert_eq "$(git -C "$ENVORA_VAULT" rev-parse HEAD)" "$head" "nothing merged"
+  assert_no_file "$(git -C "$ENVORA_VAULT" rev-parse --absolute-git-dir)/MERGE_HEAD"
+  git --git-dir="$T/remote.git" show HEAD:app/apps/web/.env.local.age >/dev/null 2>&1 && fail "the work file reached the other entry"
+  assert_eq "$(git --git-dir="$T/remote.git" show HEAD:app/.origin)" "git@github.com:me/app.git"
+  expect_rc 1 restore -C "$pa" --yes --quiet
+}
+
+t_sync_reencrypts_files_saved_with_the_old_key() {
+  local key="$T/A/home/.age/key.txt" p pb
+  p="$(mkproject app)"
+  printf 'X=1\n' >"$p/.env"
+  (cd "$p" && expect_rc 0 save -y -q)
+  new_machine B "$key"
+  pb="$(mkproject app)"
+  (cd "$pb" && expect_rc 0 restore -y -q)
+  # A rotates offline; B saves meanwhile with the old key
+  use_machine A
+  git -C "$ENVORA_VAULT" remote set-url origin "$T/nowhere.git"
+  (cd "$p" && expect_rc 3 rotate -y)
+  use_machine B
+  printf 'X=2\n' >"$pb/.env"
+  (cd "$pb" && expect_rc 0 save -y -q)
+  use_machine A
+  git -C "$ENVORA_VAULT" remote set-url origin "$T/remote.git"
+  expect_rc 0 sync
+  assert_contains "$OUT" "re-encrypted for your current key 1 file saved with the previous key: app/.env.age"
+  # a machine with only the new key reads it
+  assert_eq "$(git --git-dir="$T/remote.git" show HEAD:app/.env.age | age -d -i "$ENVORA_KEY")" "X=2"
+  rm "$p/.env"
+  (cd "$p" && expect_rc 0 restore -y -q)
+  assert_eq "$(cat "$p/.env")" "X=2"
+}
+
+t_sync_merge_failure_is_never_silent() {
+  local key="$T/A/home/.age/key.txt" p pb
+  p="$(mkproject app)"
+  printf 'X=1\n' >"$p/.env"
+  (cd "$p" && expect_rc 0 save -y -q)
+  new_machine B "$key"
+  pb="$(mkproject app)"
+  (cd "$pb" && expect_rc 0 restore -y -q)
+  # B commits a README in the vault and saves X=2
+  printf 'notes\n' >"$ENVORA_VAULT/README.md"
+  git -C "$ENVORA_VAULT" add README.md && git -C "$ENVORA_VAULT" commit -q -m readme
+  printf 'X=2\n' >"$pb/.env"
+  (cd "$pb" && expect_rc 0 save -y -q)
+  # A has an untracked README (left uncommitted) and a commit of its own
+  use_machine A
+  printf 'mine\n' >"$ENVORA_VAULT/README.md"
+  printf 'L=1\n' >"$p/.env.local"
+  (cd "$p" && expect_rc 3 save -y -q --no-sync)
+  expect_rc 1 restore -C "$p" -y
+  assert_contains "$OUT" "block the sync: README.md"
+  assert_contains "$OUT" "NOT up to date with GitHub"
+  assert_not_contains "$OUT" "already up to date"
+  assert_eq "$(cat "$p/.env")" "X=1"
+  # unrelated histories: a vault made with git init, then given a remote
+  new_machine C "$key"
+  rm -rf "$ENVORA_VAULT"
+  git init -q "$ENVORA_VAULT"
+  git -C "$ENVORA_VAULT" remote add origin "$T/remote.git"
+  local pc
+  pc="$(mkproject app)"
+  printf 'X=from-c\n' >"$pc/.env"
+  (cd "$pc" && expect_rc 3 save -y -q --no-sync)
+  expect_rc 1 sync
+  assert_contains "$OUT" "unrelated histories"
+  assert_not_contains "$OUT" "back online"
+}
+
+t_sync_forget_and_save_keep_the_origin() {
+  local key="$T/A/home/.age/key.txt" p
+  p="$(mkproject api)"
+  printf 'A=1\n' >"$p/.env"
+  (cd "$p" && expect_rc 0 save -y -q)
+  new_machine B "$key"
+  expect_rc 0 forget api -y
+  use_machine A
+  printf 'A=2\n' >"$p/.env"
+  (cd "$p" && expect_rc 3 save -y -q --no-sync)
+  expect_rc 0 sync
+  assert_contains "$OUT" "deleted on another machine, changed here"
+  assert_eq "$(cat "$ENVORA_VAULT/api/.origin")" "git@github.com:me/api.git"
+  assert_eq "$(git --git-dir="$T/remote.git" show HEAD:api/.origin)" "git@github.com:me/api.git"
+}
+
+t_interrupted_save_is_never_published() {
+  local p real pid rc=0 head
+  p="$(mkproject app)"
+  printf 'A=1\n' >"$p/.env"
+  printf 'B=1\n' >"$p/.env.local"
+  (cd "$p" && expect_rc 0 save -y -q)
+  head="$(git -C "$ENVORA_VAULT" rev-parse HEAD)"
+  printf 'A=2\n' >"$p/.env"
+  printf 'B=2\n' >"$p/.env.local"
+  # a slow encryption: the save is stopped after its first file
+  real="$(command -v age)"
+  mkdir -p "$T/slow"
+  printf '#!/bin/sh\n"%s" "$@" || exit $?\nfor a in "$@"; do [ "$a" = -r ] && [ -f "%s/slow/on" ] && sleep 3; done\nexit 0\n' "$real" "$T" >"$T/slow/age"
+  chmod +x "$T/slow/age"
+  touch "$T/slow/on"
+  set -m
+  PATH="$T/slow:$PATH" "$TEST_BASH" "$EV" save -C "$p" -y -q </dev/null >/dev/null 2>&1 &
+  pid=$!
+  local n=0
+  while [[ -z "$(git -C "$ENVORA_VAULT" status --porcelain)" && $n -lt 100 ]]; do sleep 0.1; n=$((n + 1)); done
+  kill -TERM -- "-$pid"
+  wait "$pid" || rc=$?
+  set +m
+  rm -f "$T/slow/on"
+  assert_eq "$rc" "143"
+  assert_eq "$(git -C "$ENVORA_VAULT" status --porcelain)" "" "the half save was put back"
+  # killed without a trap (SIGKILL): the next command, even a read, puts it back
+  printf 'A=3\n' | age -r "$(age-keygen -y "$ENVORA_KEY")" -o "$ENVORA_VAULT/app/.env.age"
+  printf 'app/.env.age\n' >"$(git -C "$ENVORA_VAULT" rev-parse --absolute-git-dir)/envora-inflight"
+  expect_rc 0 list -q
+  assert_contains "$OUT" "an interrupted save left 1 file half written"
+  assert_eq "$(git -C "$ENVORA_VAULT" rev-parse HEAD)" "$head" "nothing committed"
+  assert_eq "$(git -C "$ENVORA_VAULT" status --porcelain)" ""
+  assert_eq "$(age -d -i "$ENVORA_KEY" "$ENVORA_VAULT/app/.env.age")" "A=1"
+}
+
+t_vault_files_deleted_by_hand_are_put_back() {
+  local p q
+  p="$(mkproject app)"
+  q="$(mkproject other)"
+  printf 'A=1\n' >"$p/.env"
+  printf 'O=1\n' >"$q/.env"
+  (cd "$p" && expect_rc 0 save -y -q)
+  rm -rf "$ENVORA_VAULT/app"
+  cd "$q"
+  expect_rc 0 save -y
+  assert_contains "$OUT" "app/.env.age, app/.origin deleted from the vault folder: put back"
+  assert_file "$ENVORA_VAULT/app/.env.age"
+  git --git-dir="$T/remote.git" show HEAD:app/.env.age >/dev/null 2>&1 || fail "the deletion reached GitHub"
+}
+
+t_push_retries_and_key_only_commits() {
+  local key="$T/A/home/.age/key.txt" i pids="" rc out
+  new_machine B "$key"
+  for i in 1 2 3; do
+    use_machine A
+    printf 'A%s=1\n' "$i" >"$(mkproject "a$i")/.env"
+    use_machine B
+    printf 'B%s=1\n' "$i" >"$(mkproject "b$i")/.env"
+  done
+  for i in 1 2 3; do
+    (use_machine A; "$TEST_BASH" "$EV" save -C "$ENVORA_PROJECTS/a$i" -y -q </dev/null >"$T/oa$i" 2>&1; echo $? >"$T/rca$i") &
+    pids="$pids $!"
+    (use_machine B; "$TEST_BASH" "$EV" save -C "$ENVORA_PROJECTS/b$i" -y -q </dev/null >"$T/ob$i" 2>&1; echo $? >"$T/rcb$i") &
+    pids="$pids $!"
+  done
+  for i in $pids; do wait "$i" || true; done
+  for i in 1 2 3; do
+    for rc in a b; do
+      out="$(cat "$T/rc$rc$i"):$(cat "$T/o$rc$i")"
+      assert_eq "${out%%:*}" "0" "parallel save $rc$i: $out"
+    done
+  done
+  # a new vault, a folder without env files, GitHub unreachable: nothing of
+  # the folder waits, so no "PUSH FAILED" and exit 0
+  setup push_retries_fresh
+  local p
+  p="$(mkproject empty)"
+  git -C "$ENVORA_VAULT" remote set-url origin "$T/nowhere.git"
+  expect_rc 0 save -C "$p" -y -q
+  assert_not_contains "$OUT" "PUSH FAILED"
 }
 
 # --- run ---------------------------------------------------------------------
