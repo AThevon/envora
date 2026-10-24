@@ -1019,6 +1019,53 @@ t_dotenv_parser() {
   assert_eq "$got" '{"A":"1","B":"two","C":"single # not comment","D":"dq \"esc\" \n done","E":"multi\nline","F":"","G.H-I":"dots"}'
 }
 
+t_menu_previews_and_items() {
+  local p out item
+  p="$(mkproject app)"
+  mkdir -p "$p/.vercel" "$p/worker"
+  printf '{}\n' >"$p/.vercel/project.json"
+  printf 'name = "w"\n' >"$p/worker/wrangler.toml"
+  printf 'A=1\n' >"$p/.env"
+  printf 'S=1\n' >"$p/worker/.dev.vars"
+  (cd "$p" && expect_rc 0 save)
+  printf 'A=2\nB=1\n' >"$p/.env"
+  for item in save restore compare import-vercel export-vercel export-cloudflare browse sync doctor rotate keys config sep p:app; do
+    out="$(ENVORA_MENU_DIR="$p" "$TEST_BASH" "$EV" _preview "$item" 2>&1 </dev/null)" || fail "_preview $item failed: $out"
+    assert_not_contains "$out" "unbound variable" "_preview $item"
+    assert_not_contains "$out" "command not found" "_preview $item"
+  done
+  out="$(ENVORA_MENU_DIR="$p" "$TEST_BASH" "$EV" _preview save 2>&1)"
+  assert_contains "$out" "changed → the vault copy will be replaced"
+  assert_contains "$out" "1 key only in project (B)"
+  out="$(ENVORA_MENU_DIR="$p" "$TEST_BASH" "$EV" _preview export-cloudflare 2>&1)"
+  assert_contains "$out" "Worker w"
+  out="$(ENVORA_MENU_PROJECT=app "$TEST_BASH" "$EV" _preview v-restore 2>&1)"
+  assert_contains "$out" "differs"
+  out="$(ENVORA_MENU_PROJECT=app "$TEST_BASH" "$EV" _preview v-forget 2>&1)"
+  assert_contains "$out" "worker/.dev.vars"
+  # menu building blocks, under the same bash
+  out="$(cd "$p" && "$TEST_BASH" -c '
+    set -euo pipefail
+    for f in ui util config crypto project vault commands help menu providers/common providers/vercel providers/cloudflare; do
+      . "$1/lib/$f.sh"
+    done
+    ui_init_colors; ev_setup_tmp; load_config; ARG_C=""; ARG_AS=""
+    detect_current_project
+    require_key
+    save_plan
+    menu_items_project
+    menu_header_project
+    echo
+    menu_items_vault
+  ' _ "$ROOT" 2>&1)" || fail "menu blocks failed: $out"
+  assert_contains "$out" "Import Vercel"
+  assert_contains "$out" "Send to Cloudflare"
+  assert_contains "$out" "1 changed"
+  assert_contains "$out" "Rotate key"
+  assert_contains "$out" "p:app"
+  assert_contains "$out" "on this machine"
+}
+
 t_symlink_install() {
   local p
   mkdir -p "$T/bin2"

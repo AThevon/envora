@@ -127,19 +127,22 @@ cmd_menu() {
   done
 }
 
+menu_items_vault() {
+  local t=$'\t' name n
+  vault_projects | while IFS= read -r name; do
+    n="$(vault_project_files "$name" | grep -c . || true)"
+    if [[ -d "$ENVORA_PROJECTS/$name" ]]; then
+      printf '%s%s%s  %-28s %s%s · on this machine%s\n' "p:$name" "$t" "${C_ACC}◈${C_RST}" "$name" "$C_DIM" "$(plural "$n" file)" "$C_RST"
+    else
+      printf '%s%s%s  %-28s %s%s · not on this machine%s\n' "p:$name" "$t" "${C_DIM}◇${C_RST}" "$name" "$C_DIM" "$(plural "$n" file)" "$C_RST"
+    fi
+  done
+}
+
 menu_browse() {
-  local t=$'\t' name choice n
+  local name choice
   while true; do
-    choice="$(
-      vault_projects | while IFS= read -r name; do
-        n="$(vault_project_files "$name" | grep -c . || true)"
-        if [[ -d "$ENVORA_PROJECTS/$name" ]]; then
-          printf '%s%s%s  %-28s %s%s · on this machine%s\n' "p:$name" "$t" "$C_ACC◈$C_RST" "$name" "$C_DIM" "$(plural "$n" file)" "$C_RST"
-        else
-          printf '%s%s%s  %-28s %s%s · not on this machine%s\n' "p:$name" "$t" "$C_DIM◇$C_RST" "$name" "$C_DIM" "$(plural "$n" file)" "$C_RST"
-        fi
-      done | menu_fzf "vault" "${C_BOLD}vault${C_RST} ${C_DIM}$ENVORA_VAULT · esc back${C_RST}"
-    )" || return 0
+    choice="$(menu_items_vault | menu_fzf "vault" "${C_BOLD}vault${C_RST} ${C_DIM}$(tildify "$ENVORA_VAULT") · esc back${C_RST}")" || return 0
     name="${choice#p:}"
     valid_name "$name" || continue
     menu_vault_project "$name"
