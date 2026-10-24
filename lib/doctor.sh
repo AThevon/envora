@@ -69,6 +69,7 @@ cmd_doctor() {
     fi
     if vault_has_remote; then
       doc_ok "remote: $(vgit remote get-url origin)"
+      vault_net_defaults
       if [[ "${NO_SYNC:-0}" != 1 ]] && ! vgit fetch -q origin 2>"$TMP_ROOT/fetch.err"; then
         SYNC_STATE=offline
         doc_warn "cannot reach GitHub: $(head -n 1 "$TMP_ROOT/fetch.err")" "check your network / SSH key, then ev sync"

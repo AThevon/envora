@@ -40,7 +40,7 @@ save_plan() {
 }
 
 # Compute what "restore" would do. Writes $TMP_ROOT/plan.restore:
-#   new | same | differs | invalid
+#   new | same | differs | tracked | invalid
 restore_plan() {
   local base="$ENVORA_VAULT/$PROJECT_NAME" rel target plan="$TMP_ROOT/plan.restore"
   : >"$plan"
@@ -52,7 +52,9 @@ restore_plan() {
       continue
     fi
     target="$PROJECT_DIR/$rel"
-    if [[ ! -e "$target" ]]; then
+    if [[ $PROJECT_IS_GIT == 1 ]] && git -C "$PROJECT_DIR" ls-files --error-unmatch -- "$rel" >/dev/null 2>&1; then
+      printf 'tracked\t%s\n' "$rel" >>"$plan"
+    elif [[ ! -e "$target" ]]; then
       printf 'new\t%s\n' "$rel" >>"$plan"
     elif same_plaintext "$base/$rel.age" "$target"; then
       printf 'same\t%s\n' "$rel" >>"$plan"
@@ -300,6 +302,9 @@ cmd_restore() {
         ;;
       same)
         skipped_same=$((skipped_same + 1))
+        ;;
+      tracked)
+        say "${C_DIM}$rel is tracked by git here: not overwritten${C_RST}"
         ;;
       new)
         if write_restored "$rel"; then

@@ -296,7 +296,10 @@ preview_restore() {
     esac
   done <"$plan"
   while IFS=$'\t' read -r st rel; do
-    [[ "$st" == same ]] && out "  ${C_DIM}= $rel  identical, skipped${C_RST}"
+    case "$st" in
+      same) out "  ${C_DIM}= $rel  identical, skipped${C_RST}" ;;
+      tracked) out "  ${C_DIM}· $rel  tracked by git here, skipped${C_RST}" ;;
+    esac
   done <"$plan"
   out ""
   if [[ $any == 0 ]]; then

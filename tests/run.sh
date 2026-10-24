@@ -307,6 +307,11 @@ t_tracked_files_skipped() {
   assert_contains "$OUT" "tracked by git"
   assert_no_file "$ENVORA_VAULT/app/.env.test.age"
   assert_file "$ENVORA_VAULT/app/.env.age"
+  # a vault file that git now tracks in the project is never overwritten
+  printf 'OLD=1\n' | age -r "$(age-keygen -y "$ENVORA_KEY")" -o "$ENVORA_VAULT/app/.env.test.age"
+  expect_rc 0 restore --yes
+  assert_eq "$(cat "$p/.env.test")" "COMMITTED=1"
+  assert_contains "$OUT" "tracked by git here"
 }
 
 t_file_patterns() {

@@ -120,11 +120,21 @@ vault_unlock() {
   VAULT_LOCK=""
 }
 
+# Fail fast instead of hanging when the network is down (hooks run unattended).
+vault_net_defaults() {
+  if [[ -z "${GIT_SSH_COMMAND:-}" && -z "$(vgit config --get core.sshCommand 2>/dev/null)" ]]; then
+    export GIT_SSH_COMMAND="ssh -o ConnectTimeout=15"
+  fi
+  export GIT_HTTP_LOW_SPEED_LIMIT="${GIT_HTTP_LOW_SPEED_LIMIT:-1000}"
+  export GIT_HTTP_LOW_SPEED_TIME="${GIT_HTTP_LOW_SPEED_TIME:-20}"
+}
+
 # Bring the vault up to date with GitHub before reading it.
 vault_pull() {
   SYNC_PULLED=0
   vault_lock || return 1
   vault_repair || return 1
+  vault_net_defaults
   if [[ "${NO_SYNC:-0}" == 1 ]]; then
     SYNC_STATE=skipped
     return 0
