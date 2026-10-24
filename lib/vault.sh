@@ -1,414 +1,330 @@
 #!/usr/bin/env bash
-# lib/vault.sh - Vault operations (push, pull, diff, list, clean, init)
+# lib/vault.sh - the vault git repo: pull before reading, commit + push after writing
+#
+# Exit code contract used by write commands:
+#   0  written and pushed to GitHub (or nothing to do)
+#   3  committed locally but NOT pushed (offline, rejected, --no-sync, no remote)
+#   1  failure
+
+SYNC_STATE=""      # synced | offline | skipped | noremote | empty
+SYNC_PULLED=0      # commits integrated by the last pull
+SYNC_PUSHED=0      # commits pushed by the last push
+
+vgit() {
+  GIT_EDITOR=true GIT_TERMINAL_PROMPT=0 git -C "$ENVORA_VAULT" "$@"
+}
 
 vault_exists() {
   [[ -d "$ENVORA_VAULT/.git" ]]
 }
 
-# Detect current project name from git repo
-detect_project() {
-  local dir="${1:-$PWD}"
-  if git -C "$dir" rev-parse --is-inside-work-tree &>/dev/null; then
-    local root
-    root=$(git -C "$dir" rev-parse --show-toplevel 2>/dev/null)
-    basename "$root"
-  fi
+vault_has_remote() {
+  vgit remote get-url origin >/dev/null 2>&1
 }
 
-# Resolve project name: explicit arg, detected from git, or fail
-resolve_project() {
-  local name="${1:-}"
-  if [[ -z "$name" ]]; then
-    name=$(detect_project)
-  fi
-  if [[ -z "$name" ]]; then
-    ui_error "Not in a git repo. Specify a project name: ev <command> <project>"
-    return 1
-  fi
-  echo "$name"
+vault_branch() {
+  vgit symbolic-ref --short -q HEAD 2>/dev/null || printf 'main'
 }
 
-# Resolve project source dir
-resolve_source() {
-  local name="$1"
-  local dir="$ENVORA_PROJECTS/$name"
-  if [[ "$PWD" == *"/$name"* ]]; then
-    # We're inside the project
-    git rev-parse --show-toplevel 2>/dev/null || echo "$dir"
+vault_has_commits() {
+  vgit rev-parse -q --verify HEAD >/dev/null 2>&1
+}
+
+vault_upstream() {
+  local up
+  up="origin/$(vault_branch)"
+  vgit rev-parse -q --verify "refs/remotes/$up" >/dev/null 2>&1 || return 1
+  printf '%s' "$up"
+}
+
+# Commits ahead / behind the remote-tracking branch: "A B"
+vault_ahead_behind() {
+  local up
+  if ! vault_has_commits; then
+    printf '0 0'
+    return 0
+  fi
+  if up="$(vault_upstream)"; then
+    vgit rev-list --left-right --count "HEAD...$up" 2>/dev/null | awk '{print $1, $2}'
   else
-    echo "$dir"
+    printf '%s 0' "$(vgit rev-list --count HEAD 2>/dev/null || echo 0)"
   fi
 }
 
-run_init() {
-  msg "${C_BOLD}Setting up envora vault${C_RESET}"
-  msg ""
+# Use a fallback identity when git has none, so commits never fail on it.
+vault_identity() {
+  if [[ -z "$(vgit config user.email 2>/dev/null)" ]]; then
+    export GIT_AUTHOR_NAME="${GIT_AUTHOR_NAME:-envora}"
+    export GIT_AUTHOR_EMAIL="${GIT_AUTHOR_EMAIL:-envora@localhost}"
+    export GIT_COMMITTER_NAME="${GIT_COMMITTER_NAME:-envora}"
+    export GIT_COMMITTER_EMAIL="${GIT_COMMITTER_EMAIL:-envora@localhost}"
+  fi
+}
 
-  # 1. Age key
-  if [[ -f "$ENVORA_KEY" ]]; then
-    msg "Age key found at ${C_2}$ENVORA_KEY${C_RESET}"
-  else
-    msg "Generating age key..."
-    mkdir -p "$(dirname "$ENVORA_KEY")"
-    age-keygen -o "$ENVORA_KEY" 2>&1 >&2
-    chmod 600 "$ENVORA_KEY"
-    msg ""
-    msg "${C_BOLD}Save this key in your password manager:${C_RESET}"
-    msg ""
-    cat "$ENVORA_KEY" >&2
-    msg ""
-    if ! ui_confirm "Key saved? Continue?"; then
+vault_gitattributes() {
+  local f="$ENVORA_VAULT/.gitattributes"
+  if [[ ! -f "$f" ]] || ! grep -qx '\*\.age binary' "$f"; then
+    printf '*.age binary\n' >>"$f"
+  fi
+}
+
+# Leave no half-finished git operation behind; commit stray changes.
+vault_repair() {
+  local gd
+  gd="$(vgit rev-parse --absolute-git-dir 2>/dev/null)" || return 1
+  if [[ -d "$gd/rebase-merge" || -d "$gd/rebase-apply" ]]; then
+    warn "the vault was left in the middle of a rebase: aborting it"
+    vgit rebase --abort >/dev/null 2>&1 || true
+  fi
+  if [[ -f "$gd/MERGE_HEAD" ]]; then
+    warn "the vault was left in the middle of a merge: aborting it"
+    vgit merge --abort >/dev/null 2>&1 || true
+  fi
+  find "$ENVORA_VAULT" -name '*.envora-*' -type f ! -path '*/.git/*' -exec rm -f {} + 2>/dev/null || true
+  if [[ -n "$(vgit status --porcelain 2>/dev/null)" ]]; then
+    vault_identity
+    vgit add -A -f -- . >/dev/null 2>&1 &&
+      vgit commit -q -m "envora: record changes left uncommitted" >/dev/null 2>&1 || true
+  fi
+}
+
+# Bring the vault up to date with GitHub before reading it.
+vault_pull() {
+  SYNC_PULLED=0
+  vault_repair || return 1
+  if [[ "${NO_SYNC:-0}" == 1 ]]; then
+    SYNC_STATE=skipped
+    return 0
+  fi
+  if ! vault_has_remote; then
+    SYNC_STATE=noremote
+    return 0
+  fi
+  if ! vgit fetch -q origin 2>"$TMP_ROOT/fetch.err"; then
+    SYNC_STATE=offline
+    warn "cannot reach the vault remote ($(head -n 1 "$TMP_ROOT/fetch.err")): using the local vault as is"
+    return 0
+  fi
+  SYNC_STATE=synced
+  local up ab ahead behind
+  if ! up="$(vault_upstream)"; then
+    SYNC_STATE=empty
+    return 0
+  fi
+  if ! vault_has_commits; then
+    vgit checkout -q -B "$(vault_branch)" "$up" 2>"$TMP_ROOT/git.err" || {
+      err "cannot check out the vault: $(head -n 1 "$TMP_ROOT/git.err")"
       return 1
-    fi
+    }
+    SYNC_PULLED=1
+    return 0
   fi
+  ab="$(vault_ahead_behind)"
+  ahead="${ab% *}"
+  behind="${ab#* }"
+  [[ "$behind" -gt 0 ]] || return 0
+  vault_identity
+  if [[ "$ahead" -eq 0 ]]; then
+    vgit merge -q --ff-only "$up" 2>"$TMP_ROOT/git.err" || {
+      err "cannot update the vault: $(head -n 1 "$TMP_ROOT/git.err")"
+      return 1
+    }
+  elif ! vgit rebase -q "$up" >"$TMP_ROOT/git.err" 2>&1; then
+    vgit rebase --abort >/dev/null 2>&1 || true
+    vault_merge_resolve "$up" || return 1
+  fi
+  SYNC_PULLED="$behind"
+  return 0
+}
 
-  # 2. Vault repo
-  if vault_exists; then
-    msg "Vault found at ${C_2}$ENVORA_VAULT${C_RESET}"
-    # Auto-detect repo from git remote if not set
-    if [[ -z "$ENVORA_REPO" ]]; then
-      local remote_url
-      remote_url=$(git -C "$ENVORA_VAULT" remote get-url origin 2>/dev/null)
-      if [[ -n "$remote_url" ]]; then
-        ENVORA_REPO=$(echo "$remote_url" | sed 's|.*github\.com[:/]||;s|\.git$||')
-        msg "Detected repo: ${C_2}$ENVORA_REPO${C_RESET}"
-      fi
-    fi
-  else
-    msg ""
-    local choice
-    choice=$(printf "Create new private repo\nLink existing repo" | gum filter --prompt="Vault repo > " --height=5) || return 1
-
-    if [[ "$choice" == "Create new private repo" ]]; then
-      local repo_name
-      repo_name=$(gum input --prompt="Repo name: " --value="env-vault") || return 1
-      msg "Creating private repo..."
-      ENVORA_REPO=$(gh repo create "$repo_name" --private --description "Encrypted env vault managed by envora" --json nameWithOwner -q '.nameWithOwner' 2>/dev/null)
-      if [[ -z "$ENVORA_REPO" ]]; then
-        ui_error "Failed to create repo. Check gh auth."
+# Integrate diverging histories when a rebase conflicts: per conflicting
+# encrypted file, identical plaintexts are merged silently, otherwise the most
+# recently committed version wins and the other stays in git history.
+vault_merge_resolve() {
+  local up="$1" p resolved=()
+  vgit merge --no-ff --no-commit -q "$up" >"$TMP_ROOT/merge.out" 2>&1 || true
+  local conflicts
+  conflicts="$(vgit diff --name-only --diff-filter=U 2>/dev/null)"
+  if [[ -z "$conflicts" ]]; then
+    if [[ -f "$(vgit rev-parse --absolute-git-dir)/MERGE_HEAD" ]]; then
+      vgit commit -q -m "sync: merge changes from another machine" 2>"$TMP_ROOT/git.err" || {
+        vgit merge --abort >/dev/null 2>&1 || true
+        err "cannot merge the vault: $(head -n 1 "$TMP_ROOT/git.err")"
         return 1
-      fi
-      git clone "git@github.com:$ENVORA_REPO.git" "$ENVORA_VAULT" 2>/dev/null
-      ui_success "Created and cloned $ENVORA_REPO"
-    else
-      ENVORA_REPO=$(gum input --prompt="GitHub repo (user/name): ") || return 1
-      git clone "git@github.com:$ENVORA_REPO.git" "$ENVORA_VAULT" 2>/dev/null
-      ui_success "Cloned $ENVORA_REPO"
+      }
     fi
+    return 0
   fi
-
-  # 3. Save config
-  save_config
-  msg ""
-  ui_success "Vault ready at $ENVORA_VAULT"
-}
-
-# Push everything: local .env files + Vercel if detected
-cmd_push() {
-  local name
-  name=$(resolve_project "${1:-}") || return 1
-  local source
-  source=$(resolve_source "$name")
-  local total=0
-
-  # 1. Push local .env files
-  local local_count
-  local_count=$(_push_local_files "$name" "$source")
-  total=$((total + local_count))
-
-  # 2. Detect Vercel and offer to push
-  if _is_vercel_project "$source"; then
-    msg ""
-    msg "  ${C_2}Vercel project detected${C_RESET}"
-    if ui_confirm "Also pull env vars from Vercel?"; then
-      local vercel_count
-      vercel_count=$(_push_vercel_files "$name" "$source")
-      total=$((total + vercel_count))
-    fi
-  fi
-
-  if [[ $total -eq 0 ]]; then
-    ui_warn "No .env files found"
+  while IFS= read -r p; do
+    [[ -z "$p" ]] && continue
+    case "$p" in
+      .recipient)
+        vgit merge --abort >/dev/null 2>&1 || true
+        err "the vault key changed on another machine (.recipient conflict): run 'ev sync' after importing the new key"
+        return 1
+        ;;
+      *.age)
+        vault_resolve_age "$up" "$p" || {
+          vgit merge --abort >/dev/null 2>&1 || true
+          return 1
+        }
+        ;;
+      *)
+        vgit checkout -q --theirs -- "$p" 2>/dev/null || vgit rm -q -- "$p" >/dev/null 2>&1 || true
+        vgit add -f -- "$p" 2>/dev/null || true
+        ;;
+    esac
+    resolved[${#resolved[@]}]="$p"
+  done <<EOF
+$conflicts
+EOF
+  if [[ -n "$(vgit diff --name-only --diff-filter=U 2>/dev/null)" ]]; then
+    vgit merge --abort >/dev/null 2>&1 || true
+    err "could not resolve the vault conflict automatically; the vault is unchanged"
     return 1
   fi
-
-  _vault_commit_push "push: $name ($total files)"
-  ui_success "Pushed $total file(s) for $name"
-}
-
-# Push only local .env files
-cmd_push_local() {
-  local name
-  name=$(resolve_project "${1:-}") || return 1
-  local source
-  source=$(resolve_source "$name")
-
-  local count
-  count=$(_push_local_files "$name" "$source")
-
-  if [[ $count -eq 0 ]]; then
-    ui_warn "No .env files found in $source"
+  vgit commit -q -m "sync: merge, conflicts resolved ($(short_list 3 "${resolved[@]}"))" 2>"$TMP_ROOT/git.err" || {
+    vgit merge --abort >/dev/null 2>&1 || true
+    err "cannot commit the vault merge: $(head -n 1 "$TMP_ROOT/git.err")"
     return 1
+  }
+  return 0
+}
+
+vault_resolve_age() {
+  local up="$1" p="$2" stages has2=0 has3=0
+  stages="$(vgit ls-files -u -- "$p" | awk '{print $3}')"
+  case "$stages" in *2*) has2=1 ;; esac
+  case "$stages" in *3*) has3=1 ;; esac
+  if [[ $has2 == 0 ]]; then
+    vgit checkout -q --theirs -- "$p" && vgit add -f -- "$p"
+    warn "conflict on $p: deleted here, changed on another machine: kept the changed version"
+    return 0
   fi
-
-  _vault_commit_push "push-local: $name ($count files)"
-  ui_success "Pushed $count local file(s) for $name"
-}
-
-# Push only Vercel env vars
-cmd_push_vercel() {
-  local name
-  name=$(resolve_project "${1:-}") || return 1
-  local source
-  source=$(resolve_source "$name")
-
-  local count
-  count=$(_push_vercel_files "$name" "$source")
-
-  if [[ $count -eq 0 ]]; then
-    ui_warn "No env vars pulled from Vercel"
-    return 1
+  if [[ $has3 == 0 ]]; then
+    vgit checkout -q --ours -- "$p" && vgit add -f -- "$p"
+    warn "conflict on $p: deleted on another machine, changed here: kept the changed version"
+    return 0
   fi
-
-  _vault_commit_push "push-vercel: $name ($count envs)"
-  ui_success "Pushed $count Vercel env(s) for $name"
-}
-
-# --- Internal helpers ---
-
-_is_vercel_project() {
-  local source="$1"
-  [[ -d "$source/.vercel" ]]
-}
-
-_push_local_files() {
-  local name="$1" source="$2"
-  local vault_dir="$ENVORA_VAULT/$name"
-  local files
-  files=$(find_env_files "$source")
-  [[ -z "$files" ]] && echo 0 && return
-
-  mkdir -p "$vault_dir"
-  local count=0
-  while IFS= read -r f; do
-    local fname
-    fname=$(basename "$f")
-    encrypt_file "$f" "$vault_dir/${fname}.age"
-    msg "  ${C_2}+${C_RESET} $fname"
-    count=$((count + 1))
-  done <<< "$files"
-  echo "$count"
-}
-
-_push_vercel_files() {
-  local name="$1" source="$2"
-  local vault_dir="$ENVORA_VAULT/$name"
-
-  # Auto-link if needed
-  if [[ ! -d "$source/.vercel" ]]; then
-    msg "  Project not linked to Vercel. Launching vercel link..."
-    msg ""
-    if ! (cd "$source" && npx -y vercel link); then
-      ui_warn "Vercel link failed. Run 'npx -y vercel link' manually if needed."
-      echo 0; return
-    fi
+  local f_ours="$TMP_ROOT/conflict.ours" f_theirs="$TMP_ROOT/conflict.theirs" same=0 cmp_ok=1
+  vgit show ":2:$p" 2>/dev/null | age -d -i "$ENVORA_KEY" >"$f_ours" 2>/dev/null || cmp_ok=0
+  vgit show ":3:$p" 2>/dev/null | age -d -i "$ENVORA_KEY" >"$f_theirs" 2>/dev/null || cmp_ok=0
+  if [[ $cmp_ok == 1 ]] && cmp -s "$f_ours" "$f_theirs"; then
+    same=1
   fi
-
-  if [[ ! -d "$source/.vercel" ]]; then
-    ui_warn "Project not linked to Vercel"
-    echo 0; return
+  if [[ $same == 1 ]]; then
+    vgit checkout -q --ours -- "$p" && vgit add -f -- "$p"
+    rm -f "$f_ours" "$f_theirs"
+    return 0
   fi
-
-  mkdir -p "$vault_dir"
-  local tmpdir
-  tmpdir=$(mktemp -d)
-  local count=0
-
-  for env in development preview production; do
-    local fname=".env.$env"
-    msg "  Pulling $env..."
-    if (cd "$source" && timeout 30 npx -y vercel env pull "$tmpdir/$fname" --environment "$env" 2>/dev/null) && [[ -f "$tmpdir/$fname" ]]; then
-      encrypt_file "$tmpdir/$fname" "$vault_dir/${fname}.age"
-      msg "  ${C_2}+${C_RESET} $fname"
-      count=$((count + 1))
-    fi
-  done
-  rm -rf "$tmpdir"
-  echo "$count"
+  local t_ours t_theirs keep other_ref other_label kept_label
+  t_ours="$(vgit log -1 --format=%ct HEAD -- "$p" 2>/dev/null || echo 0)"
+  t_theirs="$(vgit log -1 --format=%ct "$up" -- "$p" 2>/dev/null || echo 0)"
+  if [[ "${t_ours:-0}" -gt "${t_theirs:-0}" ]]; then
+    keep=ours other_ref="$up" kept_label="this machine's" other_label="the other machine"
+  else
+    keep=theirs other_ref="HEAD" kept_label="other machine's" other_label="this machine"
+  fi
+  vgit checkout -q "--$keep" -- "$p" && vgit add -f -- "$p" || return 1
+  local other_commit details=""
+  other_commit="$(vgit log -1 --format=%h "$other_ref" -- "$p" 2>/dev/null)"
+  if [[ $cmp_ok == 1 ]]; then
+    details="$({ dotenv_json a <"$f_ours"; dotenv_json b <"$f_theirs"; } | dotenv_diff_stream | key_diff_summary "this machine" "the other machine")"
+  else
+    details="could not decrypt both versions to compare them"
+  fi
+  rm -f "$f_ours" "$f_theirs"
+  warn "conflict on $p: kept the $kept_label version (most recent save); $details. The version from $other_label stays in git history (commit $other_commit)."
+  return 0
 }
 
-_vault_commit_push() {
+# commit_paths "message" path... -> 0 committed, 1 nothing to commit, 2 error
+vault_commit() {
   local message="$1"
-  git -C "$ENVORA_VAULT" add -f -A
-  git -C "$ENVORA_VAULT" commit -m "$message" -q 2>/dev/null
-  git -C "$ENVORA_VAULT" push -q 2>/dev/null
-}
-
-cmd_pull() {
-  local name
-  name=$(resolve_project "${1:-}") || return 1
-  local dest
-  dest=$(resolve_source "$name")
-  local vault_dir="$ENVORA_VAULT/$name"
-
-  if [[ ! -d "$vault_dir" ]]; then
-    ui_warn "No vault entry for $name"
+  shift
+  vault_identity
+  vgit add -A -f -- "$@" 2>"$TMP_ROOT/git.err" || {
+    err "git add failed in the vault: $(head -n 1 "$TMP_ROOT/git.err")"
+    return 2
+  }
+  if vgit diff --cached --quiet 2>/dev/null; then
     return 1
   fi
-
-  local files
-  files=$(find_age_files "$vault_dir")
-  if [[ -z "$files" ]]; then
-    ui_warn "No encrypted files for $name"
-    return 1
-  fi
-
-  local count=0
-  while IFS= read -r f; do
-    local fname
-    fname=$(basename "$f" .age)
-    decrypt_file "$f" "$dest/$fname"
-    msg "  ${C_2}+${C_RESET} $fname"
-    count=$((count + 1))
-  done <<< "$files"
-
-  ui_success "Pulled $count file(s) for $name"
+  vgit commit -q -m "$message" 2>"$TMP_ROOT/git.err" || {
+    err "git commit failed in the vault: $(head -n 1 "$TMP_ROOT/git.err")"
+    return 2
+  }
+  return 0
 }
 
-cmd_diff() {
-  local name
-  name=$(resolve_project "${1:-}") || return 1
-  local source
-  source=$(resolve_source "$name")
-  local vault_dir="$ENVORA_VAULT/$name"
-
-  if [[ ! -d "$vault_dir" ]]; then
-    ui_warn "No vault entry for $name (nothing to diff)"
-    return 0
+# Push local vault commits. Returns 0 (pushed or nothing to push) or 3.
+vault_push() {
+  SYNC_PUSHED=0
+  local ab ahead
+  ab="$(vault_ahead_behind)"
+  ahead="${ab% *}"
+  [[ "${ahead:-0}" -gt 0 ]] || return 0
+  if [[ "${NO_SYNC:-0}" == 1 ]]; then
+    warn "vault not pushed to GitHub (--no-sync): $(plural "$ahead" commit) only on this machine"
+    return 3
   fi
-
-  local tmpdir
-  tmpdir=$(mktemp -d)
-  local has_diff=false
-
-  # Decrypt vault files to temp
-  local age_files
-  age_files=$(find_age_files "$vault_dir")
-  if [[ -n "$age_files" ]]; then
-    while IFS= read -r f; do
-      local fname
-      fname=$(basename "$f" .age)
-      decrypt_file "$f" "$tmpdir/$fname" 2>/dev/null
-    done <<< "$age_files"
+  if ! vault_has_remote; then
+    warn "the vault has no remote: $(plural "$ahead" commit) only on this machine"
+    return 3
   fi
-
-  # Compare local vs vault
-  while IFS= read -r f; do
-    local fname
-    fname=$(basename "$f")
-    if [[ -f "$tmpdir/$fname" ]]; then
-      if ! diff -q "$f" "$tmpdir/$fname" &>/dev/null; then
-        msg "${C_BOLD}$fname${C_RESET} (modified)"
-        diff --color=always "$tmpdir/$fname" "$f" >&2 || true
-        msg ""
-        has_diff=true
-      fi
-    else
-      msg "${C_BOLD}$fname${C_RESET} ${C_2}(new - not in vault)${C_RESET}"
-      has_diff=true
+  local try=1
+  while true; do
+    if vgit push -q -u origin HEAD 2>"$TMP_ROOT/push.err"; then
+      SYNC_PUSHED="$ahead"
+      return 0
     fi
-  done < <(find_env_files "$source")
+    [[ $try -ge 2 ]] && break
+    try=$((try + 1))
+    # Rejected because the remote moved: integrate and retry once.
+    if vgit fetch -q origin 2>/dev/null; then
+      vault_pull || break
+      ab="$(vault_ahead_behind)"
+      ahead="${ab% *}"
+    else
+      break
+    fi
+  done
+  err "PUSH FAILED: the vault was saved on this machine but NOT sent to GitHub"
+  sed 's/^/  git: /' "$TMP_ROOT/push.err" | grep -v '^  git: *$' | head -n 5 >&2 || true
+  say "  run 'ev sync' when you are back online"
+  return 3
+}
 
-  # Check for files in vault but not local
-  if [[ -n "$age_files" ]]; then
-    while IFS= read -r f; do
-      local fname
-      fname=$(basename "$f" .age)
-      if [[ ! -f "$source/$fname" ]]; then
-        msg "${C_BOLD}$fname${C_RESET} ${C_1}(in vault but missing locally)${C_RESET}"
-        has_diff=true
-      fi
-    done <<< "$age_files"
+# One line describing vault <-> GitHub.
+vault_sync_label() {
+  local ab ahead behind
+  if ! vault_has_remote; then
+    printf 'no GitHub remote'
+    return 0
   fi
-
-  rm -rf "$tmpdir"
-
-  if ! $has_diff; then
-    ui_success "$name: in sync with vault"
+  if [[ "$SYNC_STATE" == offline ]]; then
+    printf 'offline'
+    return 0
+  fi
+  ab="$(vault_ahead_behind)"
+  ahead="${ab% *}"
+  behind="${ab#* }"
+  if [[ "$ahead" -eq 0 && "$behind" -eq 0 ]]; then
+    printf '✓ synced with GitHub'
+  elif [[ "$behind" -eq 0 ]]; then
+    printf '↑ %s to push' "$ahead"
+  elif [[ "$ahead" -eq 0 ]]; then
+    printf '↓ %s to pull' "$behind"
+  else
+    printf '↑ %s to push · ↓ %s to pull' "$ahead" "$behind"
   fi
 }
 
-cmd_list() {
-  local projects=()
-  for dir in "$ENVORA_VAULT"/*/; do
-    [[ -d "$dir" ]] || continue
-    local name
-    name=$(basename "$dir")
-    [[ "$name" == ".git" ]] && continue
-    local files
-    files=$(find_age_files "$dir" | xargs -I{} basename {} .age | tr '\n' ' ')
-    projects+=("$name  ${C_DIM}$files${C_RESET}")
-  done
-
-  if [[ ${#projects[@]} -eq 0 ]]; then
-    ui_warn "Vault is empty"
-    return 0
+# Everything a command needs before touching the vault.
+vault_ready() {
+  if ! vault_exists; then
+    err "no vault at $ENVORA_VAULT (run 'ev init')"
+    return 1
   fi
-
-  msg "${C_BOLD}Projects in vault${C_RESET}"
-  msg ""
-  for p in "${projects[@]}"; do
-    msg "  ${C_2}*${C_RESET} $p"
-  done
-}
-
-cmd_clean() {
-  local entries=()
-  for dir in "$ENVORA_VAULT"/*/; do
-    [[ -d "$dir" ]] || continue
-    local name
-    name=$(basename "$dir")
-    [[ "$name" == ".git" ]] && continue
-    local count
-    count=$(find_age_files "$dir" | wc -l)
-    entries+=("${name}│ ${C_1}✕${C_RESET}  ${name}  ${C_DIM}${count} file(s)${C_RESET}")
-  done
-
-  if [[ ${#entries[@]} -eq 0 ]]; then
-    ui_warn "Vault is empty"
-    return 0
-  fi
-
-  local ev_bin="${ENVORA_BIN:-$0}"
-  local header
-  header=$(printf '%b' "${C_1}clean${C_RESET} │ ${C_DIM}select project to remove${C_RESET}")
-
-  local selected
-  selected=$(printf '%s\n' "${entries[@]}" | \
-    fzf --height=40% \
-        --layout=reverse \
-        --border \
-        --ansi \
-        --no-sort \
-        --header="$header" \
-        --preview "bash '$ev_bin' _list-preview {1}" \
-        --preview-window=right:50%:wrap \
-        --delimiter "│" \
-        --with-nth 2..) || return 0
-
-  [[ -z "$selected" ]] && return 0
-
-  local name
-  name="$(echo "$selected" | awk -F'│' '{gsub(/^[ \t]+|[ \t]+$/, "", $1); print $1}')"
-
-  if ! ui_confirm "Remove $name from the vault?"; then
-    return 0
-  fi
-
-  rm -rf "$ENVORA_VAULT/$name"
-  git -C "$ENVORA_VAULT" add -A
-  git -C "$ENVORA_VAULT" commit -m "clean: remove $name" -q 2>/dev/null
-  git -C "$ENVORA_VAULT" push -q 2>/dev/null
-
-  ui_success "Removed $name from vault"
+  return 0
 }

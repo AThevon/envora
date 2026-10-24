@@ -1,130 +1,238 @@
 #!/usr/bin/env bash
-# lib/config.sh - Configuration management
+# shellcheck disable=SC2016  # single-quoted $vars are for fzf/awk/jq, on purpose
+# lib/config.sh - settings: defaults < ~/.envorarc < ENVORA_* environment
+#
+# The rc file is parsed as KEY=VALUE lines, never sourced. Only known keys are
+# read. Values are written back escaped with printf %q.
 
-ENVORA_RC="$HOME/.envorarc"
+CONFIG_KEYS="ENVORA_VAULT ENVORA_KEY ENVORA_PROJECTS ENVORA_REPO ENVORA_VERCEL_CMD ENVORA_WRANGLER_CMD"
 
-# Defaults
-ENVORA_VAULT="${ENVORA_VAULT:-$HOME/.env-vault}"
-ENVORA_KEY="${ENVORA_KEY:-$HOME/.age/key.txt}"
-ENVORA_PROJECTS="${ENVORA_PROJECTS:-$HOME/projects}"
-ENVORA_REPO="${ENVORA_REPO:-}"
+config_rc_path() {
+  printf '%s' "${ENVORA_RC:-$HOME/.envorarc}"
+}
+
+# Expand a leading ~ or $HOME / ${HOME}.
+expand_path() {
+  local v="$1"
+  case "$v" in
+    "~") v="$HOME" ;;
+    \~/*) v="$HOME/${v#\~/}" ;;
+    '$HOME') v="$HOME" ;;
+    '$HOME/'*) v="$HOME/${v#\$HOME/}" ;;
+    '${HOME}') v="$HOME" ;;
+    '${HOME}/'*) v="$HOME/${v#\$\{HOME\}/}" ;;
+  esac
+  printf '%s' "$v"
+}
+
+# Undo the quoting forms we accept: "..." '...' and backslash escapes (%q).
+config_unquote() {
+  local v="$1"
+  case "$v" in
+    \"*\") v="${v#\"}"; v="${v%\"}" ;;
+    \'*\') v="${v#\'}"; v="${v%\'}"; printf '%s' "$v"; return 0 ;;
+    \$\'*) return 1 ;;
+  esac
+  local res="" c i n=${#v}
+  i=0
+  while [[ $i -lt $n ]]; do
+    c="${v:$i:1}"
+    if [[ "$c" == "\\" && $((i + 1)) -lt $n ]]; then
+      i=$((i + 1))
+      c="${v:$i:1}"
+    fi
+    res="$res$c"
+    i=$((i + 1))
+  done
+  printf '%s' "$res"
+}
+
+config_is_known() {
+  local k
+  for k in $CONFIG_KEYS; do
+    [[ "$k" == "$1" ]] && return 0
+  done
+  return 1
+}
 
 load_config() {
-  if [[ -f "$ENVORA_RC" ]]; then
-    source "$ENVORA_RC"
+  # Remember what the environment set: it wins over the rc file.
+  local k
+  for k in $CONFIG_KEYS; do
+    eval "_ENV_SET_$k=\${$k+x}"
+  done
+
+  local rc line key val
+  rc="$(config_rc_path)"
+  if [[ -f "$rc" ]]; then
+    while IFS= read -r line || [[ -n "$line" ]]; do
+      line="${line#"${line%%[![:space:]]*}"}"
+      [[ -z "$line" || "$line" == \#* ]] && continue
+      line="${line#export }"
+      [[ "$line" == *=* ]] || continue
+      key="${line%%=*}"
+      val="${line#*=}"
+      config_is_known "$key" || continue
+      val="$(config_unquote "$val")" || continue
+      if [[ -z "$(eval "printf '%s' \"\${_ENV_SET_$key}\"")" ]]; then
+        printf -v "$key" '%s' "$val"
+      fi
+    done <"$rc"
   fi
+
+  ENVORA_VAULT="$(expand_path "${ENVORA_VAULT:-$HOME/.env-vault}")"
+  ENVORA_KEY="$(expand_path "${ENVORA_KEY:-$HOME/.age/key.txt}")"
+  ENVORA_PROJECTS="$(expand_path "${ENVORA_PROJECTS:-$HOME/projects}")"
+  ENVORA_REPO="${ENVORA_REPO:-}"
+  ENVORA_VERCEL_CMD="${ENVORA_VERCEL_CMD:-}"
+  ENVORA_WRANGLER_CMD="${ENVORA_WRANGLER_CMD:-}"
+  ENVORA_STATE="$(expand_path "${XDG_STATE_HOME:-$HOME/.local/state}")/envora"
 }
 
 save_config() {
-  cat > "$ENVORA_RC" <<EOF
-ENVORA_VAULT="$ENVORA_VAULT"
-ENVORA_KEY="$ENVORA_KEY"
-ENVORA_PROJECTS="$ENVORA_PROJECTS"
-ENVORA_REPO="$ENVORA_REPO"
-EOF
+  local rc k v tmp
+  rc="$(config_rc_path)"
+  tmp="$(mktemp "$rc.envora-XXXXXX")" || return 1
+  {
+    printf '# envora settings (edit with: ev config)\n'
+    for k in ENVORA_VAULT ENVORA_KEY ENVORA_PROJECTS ENVORA_REPO ENVORA_VERCEL_CMD ENVORA_WRANGLER_CMD; do
+      eval "v=\${$k:-}"
+      [[ -z "$v" ]] && continue
+      printf '%s=%q\n' "$k" "$v"
+    done
+  } >"$tmp"
+  chmod 600 "$tmp"
+  mv -f "$tmp" "$rc"
+}
+
+# Map short names (vault, key...) to variable names.
+config_var_name() {
+  case "$1" in
+    vault|ENVORA_VAULT) echo ENVORA_VAULT ;;
+    key|ENVORA_KEY) echo ENVORA_KEY ;;
+    projects|ENVORA_PROJECTS) echo ENVORA_PROJECTS ;;
+    repo|ENVORA_REPO) echo ENVORA_REPO ;;
+    vercel-cmd|ENVORA_VERCEL_CMD) echo ENVORA_VERCEL_CMD ;;
+    wrangler-cmd|ENVORA_WRANGLER_CMD) echo ENVORA_WRANGLER_CMD ;;
+    *) return 1 ;;
+  esac
+}
+
+config_validate() {
+  local var="$1" val="$2"
+  case "$val" in
+    *$'\n'*) err "values cannot contain a newline"; return 1 ;;
+  esac
+  case "$var" in
+    ENVORA_VAULT|ENVORA_KEY|ENVORA_PROJECTS)
+      [[ -n "$val" ]] || { err "$var cannot be empty"; return 1; }
+      case "$val" in
+        /*) ;;
+        *) err "$var must be an absolute path (or start with ~)"; return 1 ;;
+      esac
+      ;;
+    ENVORA_REPO)
+      local re='^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$'
+      if [[ -n "$val" && ! "$val" =~ $re && "$val" != *:* && "$val" != /* ]]; then
+        err "ENVORA_REPO must look like user/name (or a git URL)"
+        return 1
+      fi
+      ;;
+  esac
+  return 0
+}
+
+config_set() {
+  local var val
+  var="$(config_var_name "$1")" || { err "unknown setting: $1 (vault, key, projects, repo, vercel-cmd, wrangler-cmd)"; return 1; }
+  val="$2"
+  case "$var" in
+    ENVORA_VAULT|ENVORA_KEY|ENVORA_PROJECTS) val="$(expand_path "$val")" ;;
+  esac
+  config_validate "$var" "$val" || return 1
+  printf -v "$var" '%s' "$val"
+  save_config || { err "cannot write $(config_rc_path)"; return 1; }
+  ok "$var = $val"
+}
+
+config_describe() {
+  case "$1" in
+    ENVORA_VAULT) echo "Vault: the local git repo holding the encrypted copies" ;;
+    ENVORA_KEY) echo "Key: your age private key (keep a copy in a password manager)" ;;
+    ENVORA_PROJECTS) echo "Projects: where 'ev restore NAME' looks for NAME" ;;
+    ENVORA_REPO) echo "GitHub repo of the vault (user/name)" ;;
+    ENVORA_VERCEL_CMD) echo "Command used for Vercel (default: vercel, else npx)" ;;
+    ENVORA_WRANGLER_CMD) echo "Command used for Cloudflare (default: wrangler, else npx)" ;;
+  esac
+}
+
+config_print() {
+  local k v
+  out "${C_BOLD}settings${C_RST} ${C_DIM}$(config_rc_path)${C_RST}"
+  for k in $CONFIG_KEYS; do
+    eval "v=\${$k:-}"
+    out "  $(printf '%-20s' "$k") ${v:-${C_DIM}(not set)${C_RST}}"
+    out "  $(printf '%-20s' '') ${C_DIM}$(config_describe "$k")${C_RST}"
+  done
 }
 
 cmd_config() {
-  local ev_bin="${ENVORA_BIN:-$0}"
-
-  local header
-  header="$(printf '%b' "${C_2}config${C_RESET} │ ${C_DIM}${ENVORA_RC}${C_RESET}")"
-
-  local menu_items=(
-    "vault   │ ${C_2}◈${C_RESET}  Vault path       ${C_DIM}${ENVORA_VAULT}${C_RESET}"
-    "key     │ ${C_2}⚿${C_RESET}  Key path         ${C_DIM}${ENVORA_KEY}${C_RESET}"
-    "projects│ ${C_2}▤${C_RESET}  Projects path    ${C_DIM}${ENVORA_PROJECTS}${C_RESET}"
-    "repo    │ ${C_2}⊞${C_RESET}  GitHub repo      ${C_DIM}${ENVORA_REPO:-not set}${C_RESET}"
-  )
-
-  local tmpfile
-  tmpfile="$(mktemp)"
-
-  printf '%s\n' "${menu_items[@]}" \
-  | fzf \
-    --ansi \
-    --no-sort \
-    --height=30% \
-    --layout=reverse \
-    --border \
-    --header "$header" \
-    --preview "bash '$ev_bin' _config-preview {1}" \
-    --preview-window "right:50%:wrap" \
-    --delimiter "│" \
-    --with-nth 2.. \
-  > "$tmpfile" || { rm -f "$tmpfile"; return 0; }
-
-  local choice
-  choice="$(cat "$tmpfile")"
-  rm -f "$tmpfile"
-
-  local cmd
-  cmd="$(echo "$choice" | awk -F'│' '{gsub(/^[ \t]+|[ \t]+$/, "", $1); print $1}')"
-
-  local current=""
-  local var_name=""
-  case "$cmd" in
-    vault)    current="$ENVORA_VAULT"; var_name="ENVORA_VAULT" ;;
-    key)      current="$ENVORA_KEY"; var_name="ENVORA_KEY" ;;
-    projects) current="$ENVORA_PROJECTS"; var_name="ENVORA_PROJECTS" ;;
-    repo)     current="$ENVORA_REPO"; var_name="ENVORA_REPO" ;;
-    *) return 0 ;;
+  local sub="${1:-}"
+  case "$sub" in
+    "")
+      if is_interactive && has fzf; then
+        config_menu
+      else
+        config_print
+      fi
+      ;;
+    get)
+      local var
+      var="$(config_var_name "${2:-}")" || { err "unknown setting: ${2:-}"; return 1; }
+      eval "out \"\${$var:-}\""
+      ;;
+    set)
+      [[ $# -ge 3 ]] || { err "usage: ev config set <setting> <value>"; return 1; }
+      config_set "$2" "$3"
+      ;;
+    *)
+      err "usage: ev config [get <setting> | set <setting> <value>]"
+      return 1
+      ;;
   esac
-
-  local new_value
-  new_value=$(gum input --prompt="$var_name: " --value="$current") || return 0
-
-  case "$cmd" in
-    vault)    ENVORA_VAULT="$new_value" ;;
-    key)      ENVORA_KEY="$new_value" ;;
-    projects) ENVORA_PROJECTS="$new_value" ;;
-    repo)     ENVORA_REPO="$new_value" ;;
-  esac
-
-  save_config
-  ui_success "Config saved"
 }
 
-# Config preview - called by fzf via ev.sh dispatch
-config_preview() {
-  local key="$1"
-  local G=$'\033[38;2;52;211;153m' R=$'\033[0m' B=$'\033[1m' D=$'\033[2m'
+config_menu() {
+  local choice var cur new
+  while true; do
+    choice="$(
+      for var in ENVORA_VAULT ENVORA_KEY ENVORA_PROJECTS ENVORA_REPO ENVORA_VERCEL_CMD ENVORA_WRANGLER_CMD; do
+        eval "cur=\${$var:-}"
+        printf '%s\t%-18s %s\n' "$var" "${var#ENVORA_}" "${cur:-(not set)}"
+      done | fzf --ansi --height=~40% --layout=reverse --border=rounded \
+        --border-label=" settings " --delimiter=$'\t' --with-nth=2 \
+        --no-input --header="enter edit · esc back" \
+        --color="$FZF_COLORS" \
+        --preview='"$ENVORA_BASH" "$ENVORA_SELF" _preview config {1}' \
+        --preview-window='right,50%,wrap'
+    )" || return 0
+    var="${choice%%$'\t'*}"
+    eval "cur=\${$var:-}"
+    new="$(ask "$var:" "$cur")" || continue
+    [[ "$new" == "$cur" ]] && continue
+    config_set "$var" "$new" || true
+  done
+}
 
-  case "$key" in
-    vault)
-      echo -e "${G}◈${R}  Vault path"
-      echo ""
-      echo "Path to the vault directory."
-      echo "This is a git repo containing"
-      echo "encrypted .env files."
-      echo ""
-      echo -e "${D}Default: ~/.env-vault${R}"
-      ;;
-    key)
-      echo -e "${G}⚿${R}  Key path"
-      echo ""
-      echo "Path to your age private key."
-      echo "Used to encrypt and decrypt"
-      echo ".env files in the vault."
-      echo ""
-      echo -e "${D}Default: ~/.age/key.txt${R}"
-      ;;
-    projects)
-      echo -e "${G}▤${R}  Projects path"
-      echo ""
-      echo "Path to your projects directory."
-      echo "Used to resolve project names"
-      echo "when not inside a git repo."
-      echo ""
-      echo -e "${D}Default: ~/projects${R}"
-      ;;
-    repo)
-      echo -e "${G}⊞${R}  GitHub repo"
-      echo ""
-      echo "GitHub repo for the vault"
-      echo "(user/name format)."
-      echo ""
-      echo "Set automatically during ev init."
-      ;;
-  esac
+config_preview() {
+  local var="$1" v
+  eval "v=\${$var:-}"
+  out "${C_BOLD}${var}${C_RST}"
+  out ""
+  out "$(config_describe "$var")"
+  out ""
+  out "current: ${v:-(not set)}"
+  out ""
+  out "${C_DIM}stored in $(config_rc_path)${C_RST}"
+  out "${C_DIM}an ENVORA_* environment variable overrides the file${C_RST}"
 }
