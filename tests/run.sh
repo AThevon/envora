@@ -181,7 +181,7 @@ STUB
 echo "gh $*" >>"$STUB/gh.log"
 case "$1 ${2:-}" in
   "auth status") exit 0 ;;
-  "repo create") git init -q --bare "$STUB/gh-$3.git" ;;
+  "repo create") git init -q --bare -b main "$STUB/gh-$3.git" ;;
   "repo view") echo "me/$3" ;;
   "repo clone") git clone -q "$STUB/gh-${3#me/}.git" "$4" ;;
   *) exit 1 ;;
@@ -201,7 +201,8 @@ setup() {
   unset GIT_AUTHOR_DATE GIT_COMMITTER_DATE
   install_stubs
   export PATH="$T/bin:$ORIG_PATH"
-  git init -q --bare "$T/remote.git"
+  export GIT_CONFIG_GLOBAL="$T/no-global-gitconfig"
+  git init -q --bare -b main "$T/remote.git"
   new_machine A
 }
 
