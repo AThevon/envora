@@ -45,7 +45,7 @@ menu_header_project() {
   local state
   if [[ "$n_vault" -eq 0 ]]; then
     state="not saved yet"
-    [[ "$new" -gt 0 ]] && state="not saved yet · $(plural "$new" env file) here"
+    [[ "$new" -gt 0 ]] && state="not saved yet · $(plural "$new" "env file") here"
   else
     parts[${#parts[@]}]="$(plural "$n_vault" file) saved"
     if [[ $((changed + new)) -eq 0 && "$missing" -eq 0 ]]; then

@@ -77,7 +77,7 @@ cmd_doctor() {
         local label
         label="$(vault_sync_label)"
         case "$label" in
-          ✓*) doc_ok "$label" ;;
+          ✓*) doc_ok "${label#✓ }" ;;
           *) doc_warn "$label" "ev sync" ;;
         esac
       fi
@@ -105,7 +105,7 @@ cmd_doctor() {
       [[ -z "$rel" ]] && continue
       doc_warn "$rel is tracked by git: envora skips it (it is in your git history)" "git rm --cached '$rel' && echo '$rel' >> .gitignore, then ev save"
     done <"$TMP_ROOT/scan.tracked"
-    [[ $n -gt 0 ]] && doc_ok "$(plural "$n" env file) handled by envora"
+    [[ $n -gt 0 ]] && doc_ok "$(plural "$n" "env file") handled by envora"
     [[ $n -eq 0 ]] && doc_info "no env files in this project"
     if vault_exists && [[ $key_ok == 1 && -d "$ENVORA_VAULT/$PROJECT_NAME" ]]; then
       check_origin "$PROJECT_NAME" >/dev/null 2>&1 || doc_bad "the vault entry '$PROJECT_NAME' belongs to another repository" "ev save --as <other-name>"
