@@ -1,0 +1,221 @@
+#!/usr/bin/env bash
+# lib/init.sh - first-time or new-machine setup
+
+# Extract AGE-SECRET-KEY lines from pasted text and install them as the key.
+install_key_from_text() {
+  local text="$1" secret pub
+  secret="$(printf '%s\n' "$text" | tr -d '\r' | grep -E '^[[:space:]]*AGE-SECRET-KEY-' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' || true)"
+  if [[ -z "$secret" ]]; then
+    err "no AGE-SECRET-KEY-... line found in what you pasted"
+    return 1
+  fi
+  pub="$(printf '%s\n' "$secret" | age-keygen -y 2>/dev/null | head -n 1)" || pub=""
+  [[ -n "$pub" ]] || { err "this is not a valid age key"; return 1; }
+  mkdir -p "$(dirname "$ENVORA_KEY")" || return 1
+  chmod 700 "$(dirname "$ENVORA_KEY")" 2>/dev/null || true
+  register_cleanup "$ENVORA_KEY.envora-tmp"
+  {
+    printf '# envora key, imported %s\n' "$(date +%Y-%m-%dT%H:%M:%S)"
+    printf '# public key: %s\n' "$pub"
+    printf '%s\n' "$secret"
+  } >"$ENVORA_KEY.envora-tmp"
+  chmod 600 "$ENVORA_KEY.envora-tmp"
+  mv -f "$ENVORA_KEY.envora-tmp" "$ENVORA_KEY"
+  KEY_PUB="$pub"
+  ok "key saved to $ENVORA_KEY ($(printf '%.20s' "$pub")...)"
+}
+
+init_import_key() {
+  local text=""
+  if is_interactive; then
+    say "Paste your envora key (the AGE-SECRET-KEY-... line, or the whole key file)."
+    if has gum; then
+      text="$(gum input --password --placeholder "AGE-SECRET-KEY-..." --width 80 </dev/tty)" || return 1
+    else
+      printf 'key: ' >&2
+      IFS= read -rs text </dev/tty || return 1
+      printf '\n' >&2
+    fi
+  else
+    text="$(cat)"
+  fi
+  install_key_from_text "$text"
+}
+
+init_generate_key() {
+  local keygen_args=()
+  [[ "${INIT_PQ:-0}" == 1 ]] && keygen_args=(-pq)
+  mkdir -p "$(dirname "$ENVORA_KEY")" || return 1
+  chmod 700 "$(dirname "$ENVORA_KEY")" 2>/dev/null || true
+  age-keygen ${keygen_args[@]+"${keygen_args[@]}"} -o "$ENVORA_KEY" 2>"$TMP_ROOT/keygen.err" || {
+    err "cannot generate a key: $(head -n 1 "$TMP_ROOT/keygen.err")"
+    return 1
+  }
+  chmod 600 "$ENVORA_KEY"
+  KEY_PUB="$(pubkey_of "$ENVORA_KEY")"
+  say ""
+  say "${C_BOLD}Your new envora key. Save it in your password manager now (shown once):${C_RST}"
+  say ""
+  sed 's/^/    /' "$ENVORA_KEY" >&2
+  say ""
+  say "Without it, nobody (not even you) can decrypt the vault on another machine."
+  if is_interactive && ! confirm "I saved the key in my password manager"; then
+    warn "keep it safe: it is in $ENVORA_KEY"
+  fi
+  return 0
+}
+
+# repo spec -> clone URL
+repo_clone_url() {
+  local r="$1" re='^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$'
+  if [[ "$r" =~ $re ]]; then
+    printf 'git@github.com:%s.git' "$r"
+  else
+    printf '%s' "$r"
+  fi
+}
+
+init_clone() {
+  local repo="$1" re='^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$'
+  mkdir -p "$(dirname "$ENVORA_VAULT")" || return 1
+  step "cloning $repo into $ENVORA_VAULT"
+  if [[ "$repo" =~ $re ]] && has gh && gh auth status >/dev/null 2>&1; then
+    gh repo clone "$repo" "$ENVORA_VAULT" -- -q 2>"$TMP_ROOT/clone.err" || {
+      err "cannot clone $repo: $(tail -n 1 "$TMP_ROOT/clone.err")"
+      return 1
+    }
+  else
+    git clone -q "$(repo_clone_url "$repo")" "$ENVORA_VAULT" 2>"$TMP_ROOT/clone.err" || {
+      err "cannot clone $repo: $(tail -n 1 "$TMP_ROOT/clone.err")"
+      return 1
+    }
+  fi
+  case "$repo" in
+    */*) [[ "$repo" =~ $re ]] && ENVORA_REPO="$repo" ;;
+  esac
+  ok "vault cloned"
+}
+
+init_create() {
+  local name="$1" full
+  has gh || { err "creating a repo needs the GitHub CLI (gh)"; return 1; }
+  valid_name "$name" || { err "invalid repo name: $name"; return 1; }
+  step "creating the private repo $name on GitHub"
+  gh repo create "$name" --private --description "Encrypted env vault managed by envora" >/dev/null 2>"$TMP_ROOT/gh.err" || {
+    err "gh repo create failed: $(tail -n 1 "$TMP_ROOT/gh.err")"
+    return 1
+  }
+  full="$(gh repo view "$name" --json nameWithOwner -q .nameWithOwner 2>"$TMP_ROOT/gh.err")" || full=""
+  if [[ -z "$full" ]]; then
+    err "repo created but its full name could not be read: $(tail -n 1 "$TMP_ROOT/gh.err")"
+    return 1
+  fi
+  init_clone "$full" || return 1
+  ENVORA_REPO="$full"
+}
+
+init_pick_repo() {
+  local choice repo
+  choice="$(choose "Where is your vault?" \
+    "Clone my existing vault repo" \
+    "Create a new private repo on GitHub")" || return 1
+  case "$choice" in
+    Clone*)
+      if has gh && gh auth status >/dev/null 2>&1 && has fzf; then
+        repo="$(gh repo list --limit 200 --json nameWithOwner,isPrivate -q '.[] | select(.isPrivate) | .nameWithOwner' 2>/dev/null |
+          fzf --height=~40% --layout=reverse --border=rounded --border-label=" your private repos " \
+            --print-query --header="pick the vault repo, or type user/name" --color="$FZF_COLORS" | tail -n 1)" || true
+      fi
+      [[ -n "${repo:-}" ]] || repo="$(ask "Vault repo (user/name or git URL):" "${ENVORA_REPO:-}")" || return 1
+      [[ -n "$repo" ]] || return 1
+      init_clone "$repo"
+      ;;
+    Create*)
+      local name
+      name="$(ask "New repo name:" "env-vault")" || return 1
+      init_create "$name"
+      ;;
+    *) return 1 ;;
+  esac
+}
+
+run_init() {
+  local key_mode="" repo="" create=""
+  INIT_PQ=0
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --import-key) key_mode=import ;;
+      --generate-key) key_mode=generate ;;
+      --pq) INIT_PQ=1 ;;
+      --repo) [[ $# -ge 2 ]] || { err "--repo needs a value"; return 1; }; repo="$2"; shift ;;
+      --create) [[ $# -ge 2 ]] || { err "--create needs a name"; return 1; }; create="$2"; shift ;;
+      *) err "unknown option for init: $1"; return 1 ;;
+    esac
+    shift
+  done
+
+  say "${C_BOLD}1. your key${C_RST}  ${C_DIM}$ENVORA_KEY${C_RST}"
+  if key_exists; then
+    require_key || return 1
+    ok "key found ($(printf '%.20s' "$KEY_PUB")...)"
+  else
+    if [[ -z "$key_mode" ]]; then
+      if is_interactive; then
+        local c
+        c="$(choose "No envora key on this machine." \
+          "I already have an envora key (paste it from your password manager)" \
+          "Generate a new key (first time using envora)")" || return 1
+        case "$c" in
+          I*) key_mode=import ;;
+          *) key_mode=generate ;;
+        esac
+      else
+        err "no key at $ENVORA_KEY: use --import-key (key on stdin) or --generate-key"
+        return 1
+      fi
+    fi
+    case "$key_mode" in
+      import) init_import_key || return 1 ;;
+      generate) init_generate_key || return 1 ;;
+    esac
+  fi
+
+  say ""
+  say "${C_BOLD}2. your vault${C_RST}  ${C_DIM}$ENVORA_VAULT${C_RST}"
+  if vault_exists; then
+    ok "vault found"
+    if [[ -z "$ENVORA_REPO" ]]; then
+      local url
+      url="$(vgit remote get-url origin 2>/dev/null || true)"
+      case "$url" in
+        *github.com*)
+          ENVORA_REPO="$(printf '%s' "$url" | sed 's|.*github\.com[:/]||;s|\.git$||')"
+          ;;
+      esac
+    fi
+  elif [[ -e "$ENVORA_VAULT" && -n "$(ls -A "$ENVORA_VAULT" 2>/dev/null)" ]]; then
+    err "$ENVORA_VAULT exists but is not a git repo: move it away or set another path (ev config set vault ...)"
+    return 1
+  elif [[ -n "$create" ]]; then
+    init_create "$create" || return 1
+  elif [[ -n "$repo" ]]; then
+    init_clone "$repo" || return 1
+  elif is_interactive; then
+    init_pick_repo || return 1
+  else
+    err "no vault at $ENVORA_VAULT: use --repo user/name (clone) or --create name"
+    return 1
+  fi
+
+  # The vault must be encrypted for this key.
+  local rec
+  if rec="$(vault_recipient)" && [[ -n "$rec" && "$rec" != "$KEY_PUB" ]]; then
+    recipient_mismatch_message "$rec"
+    return 1
+  fi
+
+  save_config || warn "cannot write $(config_rc_path)"
+  say ""
+  ok "envora is ready: vault $ENVORA_VAULT${ENVORA_REPO:+ ($ENVORA_REPO)}"
+  return 0
+}
