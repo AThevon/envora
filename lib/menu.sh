@@ -42,24 +42,33 @@ menu_run() {
   return 0
 }
 
-# menu_fzf LABEL HEADER [POS] < items  ->  chosen id
+# menu_fzf LABEL HEADER [POS] [SEP] < items  ->  chosen id
 # The cursor starts on line POS (the last action), the preview sits on the
 # right when it has room (at least 52 columns), else below, kept small so
-# every menu line stays visible.
+# every menu line stays visible. SEP is the line of the separator (if any):
+# moving with the arrows or j / k jumps over it.
 MENU_FZF_RC=0
 menu_fzf() {
-  local label="$1" header="$2" pos="${3:-1}" choice
+  local label="$1" header="$2" pos="${3:-1}" sep="${4:-0}" choice
+  local down='down' up='up'
   MENU_FZF_RC=0
   case "$pos" in ''|*[!0-9]*) pos=1 ;; esac
+  case "$sep" in ''|*[!0-9]*) sep=0 ;; esac
+  if [[ $sep -gt 1 ]]; then
+    # {n} is the 0-based index of the current line
+    down="transform:[ {n} -eq $((sep - 2)) ] && echo down+down || echo down"
+    up="transform:[ {n} -eq $sep ] && echo up+up || echo up"
+  fi
   choice="$(ENVORA_COLOR=1 fzf --ansi --no-sort --no-input --layout=reverse \
     --height=85% --min-height=24 --border=rounded --border-label=" $label " \
     --delimiter=$'\t' --with-nth=2 --header="$header" --header-first \
     --pointer='›' --color="$FZF_COLORS" \
     --preview='"$ENVORA_BASH" "$ENVORA_SELF" _preview {1}' \
-    --preview-window='right,45%,wrap,border-left,<52(down,40%,wrap,border-top)' \
+    --preview-window='right,40%,wrap,border-left,<44(down,40%,wrap,border-top)' \
     --bind="load:pos($pos)" \
     --bind='?:preview("$ENVORA_BASH" "$ENVORA_SELF" _preview keys)' \
-    --bind='j:down,k:up,q:abort')" || MENU_FZF_RC=$?
+    --bind="down:$down" --bind="j:$down" --bind="up:$up" --bind="k:$up" \
+    --bind='q:abort')" || MENU_FZF_RC=$?
   [[ $MENU_FZF_RC == 0 ]] || return 1
   printf '%s' "${choice%%$'\t'*}"
 }
@@ -102,60 +111,91 @@ menu_header_project() {
     fi
     state="$(join_by ' · ' "${parts[@]}")"
   fi
-  printf '%s%s%s  %s\n%s%s%s' "$C_BOLD" "$PROJECT_NAME" "$C_RST" "$state" "$C_DIM" "$(vault_sync_label) · ? help" "$C_RST"
+  printf '%s%s%s  %s\n%s%s%s' "$C_BOLD" "$PROJECT_NAME" "$C_RST" "$state" "$C_DIM" "vault: $(vault_sync_label) · ? keys" "$C_RST"
+}
+
+# pad TEXT WIDTH: TEXT followed by spaces up to WIDTH characters. printf
+# pads bytes, and an arrow is 3 bytes: UTF-8 continuation bytes are not
+# counted (whatever the locale).
+pad() {
+  local n
+  n="$(printf '%s' "$1" | LC_ALL=C tr -d '\200-\277' | wc -c)"
+  n=$((n + 0))
+  printf '%s%*s' "$1" $(($2 > n ? $2 - n : 1)) ''
+}
+
+# menu_line ID ICON LABEL DIRECTION DESCRIPTION [dim]
+# One menu line, in columns: icon, verb (20), where data goes (20), what for.
+menu_line() {
+  local id="$1" icon="$2" label="$3" dir="$4" desc="$5" ic="$C_ACC"
+  [[ "${6:-}" == dim ]] && ic="$C_DIM"
+  printf '%s\t%s%s%s  %s%s%s%s%s%s%s\n' "$id" "$ic" "$icon" "$C_RST" "$(pad "$label" 20)" \
+    "$C_ACC" "$(pad "$dir" 20)" "$C_RST" "$C_DIM" "$desc" "$C_RST"
 }
 
 menu_items_project() {
-  local t=$'\t' a="$C_ACC" d="$C_DIM" r="$C_RST"
-  printf '%s\n' \
-    "save${t}${a}↑${r}  Save               ${a}project → vault${r}     ${d}encrypt env files${r}" \
-    "restore${t}${a}↓${r}  Restore            ${a}vault → project${r}     ${d}write them back${r}" \
-    "compare${t}${a}≈${r}  Compare            ${a}project ↔ vault${r}     ${d}key names only${r}"
+  menu_line save "↑" "Save" "project → vault" "encrypt env files"
+  menu_line restore "↓" "Restore" "vault → project" "write them back here"
+  menu_line compare "≈" "Compare" "project ↔ vault" "key names only"
   if vercel_relevant; then
-    printf '%s\n' \
-      "import-vercel${t}${a}▲${r}  Import Vercel      ${a}Vercel → vault${r}      ${d}snapshot Vercel vars${r}" \
-      "export-vercel${t}${a}▲${r}  Send to Vercel     ${a}vault → Vercel${r}      ${d}add / update vars${r}"
+    menu_line import-vercel "▲" "Import Vercel" "Vercel → vault" "snapshot Vercel vars"
+    menu_line export-vercel "▲" "Send to Vercel" "vault → Vercel" "add / update vars"
   fi
   if cloudflare_relevant; then
-    printf '%s\n' \
-      "export-cloudflare${t}${a}☁${r}  Send to Cloudflare ${a}vault → Cloudflare${r}  ${d}$(cloudflare_kinds) secrets${r}"
+    menu_line export-cloudflare "☁" "Send to Cloudflare" "vault → Cloudflare" "$(cloudflare_kinds) secrets"
   fi
   menu_items_global
 }
 
 menu_items_global() {
-  local t=$'\t' a="$C_ACC" d="$C_DIM" r="$C_RST"
-  printf '%s\n' \
-    "sep${t}${d}──────────────────────────────────────────${r}" \
-    "browse${t}${d}☰${r}  Browse vault       ${d}every saved project${r}" \
-    "sync${t}${d}⇅${r}  Sync with GitHub   ${a}vault ↔ GitHub${r}" \
-    "doctor${t}${d}✚${r}  Doctor             ${d}check the setup, with fixes${r}" \
-    "config${t}${d}⚙${r}  Settings           ${d}paths and repo${r}" \
-    "rotate${t}${d}⟳${r}  Rotate key         ${d}new key, re-encrypt all${r}"
+  printf 'sep\t%s%s%s\n' "$C_DIM" "──────────────────────────────── whole vault" "$C_RST"
+  menu_line browse "≡" "Browse vault" "vault" "every saved project" dim
+  menu_line sync "⇅" "Sync with GitHub" "vault ↔ GitHub" "pull + push now" dim
+  menu_line doctor "✚" "Doctor" "" "check the setup" dim
+  menu_line config "⚙" "Settings" "" "paths and repo" dim
+  menu_line rotate "⟳" "Rotate key" "vault" "new key, re-encrypt" dim
+}
+
+# The folder the menu acts on: -C, else the current folder (in a monorepo,
+# Send to Vercel / Cloudflare pick the config around it, like the CLI).
+menu_dir() {
+  if [[ -n "${ARG_C:-}" ]]; then abs_dir "$ARG_C"; else pwd -P; fi
 }
 
 cmd_menu() {
   ui_logo
-  vault_pull >/dev/null 2>&1 || true
+  # Show what the sync did (a conflict resolved, offline...) before the menu.
+  vault_pull >/dev/null 2>"$TMP_ROOT/menu.pull" || true
   vault_unlock
-  local choice in_project=0
+  if [[ -s "$TMP_ROOT/menu.pull" ]]; then
+    cat "$TMP_ROOT/menu.pull" >&2
+    printf '\n%spress any key to open the menu%s' "$C_DIM" "$C_RST" >&2
+    local key=""
+    IFS= read -rsn1 key </dev/tty 2>/dev/null || true
+    printf '\n' >&2
+  fi
+  local_index_build
+  export ENVORA_LOCAL_INDEX="$LOCAL_INDEX"
+  local choice in_project=0 mdir
+  mdir="$(menu_dir)"
   if detect_current_project 2>/dev/null; then
     in_project=1
-    export ENVORA_MENU_DIR="$PROJECT_DIR"
+    export ENVORA_MENU_DIR="$mdir"
     export ENVORA_MENU_AS="${ARG_AS:-}"
   fi
-  local items pos=1 rc=0
+  local items pos=1 rc=0 sep
   while true; do
     if [[ $in_project == 1 ]]; then
       save_plan 2>/dev/null || true
       items="$(menu_items_project)"
-      choice="$(printf '%s\n' "$items" | menu_fzf "envora · project" "$(menu_header_project)" "$pos")" || {
+      sep="$(printf '%s\n' "$items" | menu_pos_of sep)"
+      choice="$(printf '%s\n' "$items" | menu_fzf "envora · project" "$(menu_header_project)" "$pos" "$sep")" || {
         menu_fzf_failed && return 1
         return 0
       }
     else
       items="$(menu_items_global | sed 1d)"
-      choice="$(printf '%s\n' "$items" | menu_fzf "envora" "${C_BOLD}envora${C_RST} ${C_DIM}v$VERSION · not in a project · $(vault_sync_label) · ? help${C_RST}" "$pos")" || {
+      choice="$(printf '%s\n' "$items" | menu_fzf "envora" "${C_BOLD}envora${C_RST} ${C_DIM}v$VERSION · not in a project${C_RST}"$'\n'"${C_DIM}vault: $(vault_sync_label) · ? keys${C_RST}" "$pos")" || {
         menu_fzf_failed && return 1
         return 0
       }
@@ -163,8 +203,8 @@ cmd_menu() {
     pos="$(printf '%s\n' "$items" | menu_pos_of "$choice")"
     local cargs=()
     if [[ $in_project == 1 ]]; then
-      cargs=(-C "$PROJECT_DIR")
-      [[ -n "${ARG_AS:-}" ]] && cargs=(-C "$PROJECT_DIR" --as "$ARG_AS")
+      cargs=(-C "$mdir")
+      [[ -n "${ARG_AS:-}" ]] && cargs=(-C "$mdir" --as "$ARG_AS")
     fi
     rc=0
     case "$choice" in
@@ -182,19 +222,21 @@ cmd_menu() {
       *) ;;
     esac
     [[ $rc == 0 ]] || return 0
-    # The vault may have moved (save, sync): refresh the header state.
+    # The vault may have moved (save, sync, clone): refresh the state.
     SYNC_STATE=""
+    local_index_build
   done
 }
 
 menu_items_vault() {
-  local t=$'\t' name n
+  local name n dir
   vault_projects | while IFS= read -r name; do
     n="$(vault_project_files "$name" | grep -c . || true)"
-    if [[ -d "$ENVORA_PROJECTS/$name" ]]; then
-      printf '%s%s%s  %-28s %s%s · on this machine%s\n' "p:$name" "$t" "${C_ACC}◈${C_RST}" "$name" "$C_DIM" "$(plural "$n" file)" "$C_RST"
+    dir="$(local_dir_of "$name")"
+    if [[ -n "$dir" ]]; then
+      printf 'p:%s\t%s◆%s  %-28s %s%s · %s%s\n' "$name" "$C_ACC" "$C_RST" "$name" "$C_DIM" "$(plural "$n" file)" "$(tildify "$dir")" "$C_RST"
     else
-      printf '%s%s%s  %-28s %s%s · not on this machine%s\n' "p:$name" "$t" "${C_DIM}◇${C_RST}" "$name" "$C_DIM" "$(plural "$n" file)" "$C_RST"
+      printf 'p:%s\t%s◇%s  %-28s %s%s · not on this machine%s\n' "$name" "$C_DIM" "$C_RST" "$name" "$C_DIM" "$(plural "$n" file)" "$C_RST"
     fi
   done
 }
@@ -213,30 +255,39 @@ menu_browse() {
     name="${choice#p:}"
     valid_name "$name" || continue
     menu_vault_project "$name"
+    local_index_build
   done
 }
 
+# Where "Clone + restore" puts a project: ENVORA_PROJECTS/<name>.
+clone_target() {
+  printf '%s/%s' "$ENVORA_PROJECTS" "$1"
+}
+
 menu_vault_project() {
-  local name="$1" t=$'\t' a="$C_ACC" d="$C_DIM" r="$C_RST" dir="$ENVORA_PROJECTS/$1" choice origin=""
-  [[ -f "$ENVORA_VAULT/$name/.origin" ]] && origin="$(head -n 1 "$ENVORA_VAULT/$name/.origin")"
-  export ENVORA_MENU_PROJECT="$name"
-  local items
-  if [[ -d "$dir" ]]; then
-    items="v-restore${t}${a}↓${r}  Restore            ${a}vault → $(tildify "$dir")${r}"$'\n'"v-compare${t}${a}≈${r}  Compare            ${a}project ↔ vault${r}"
+  local name="$1" dir choice origin target items
+  origin="$(entry_origin "$name")"
+  dir="$(local_dir_of "$name")"
+  target="$(clone_target "$name")"
+  export ENVORA_MENU_PROJECT="$name" ENVORA_MENU_PROJECT_DIR="$dir"
+  if [[ -n "$dir" ]]; then
+    items="$(menu_line v-restore "↓" "Restore" "vault → project" "into $(tildify "$dir")")"$'\n'"$(menu_line v-compare "≈" "Compare" "project ↔ vault" "key names only")"
+  elif [[ -n "$origin" && ! -e "$target" ]]; then
+    items="$(menu_line v-clone "↓" "Clone + restore" "GitHub + vault" "into $(tildify "$target")")"
   elif [[ -n "$origin" ]]; then
-    items="v-clone${t}${a}↓${r}  Clone + restore    ${a}GitHub + vault → $(tildify "$dir")${r}"
+    items="v-none"$'\t'"${C_DIM}·  $(tildify "$target") exists but is another project: clone $name elsewhere, then ev restore -C <dir>${C_RST}"
   else
-    items="v-none${t}${d}·  no local folder and no known origin: clone it yourself into $dir${r}"
+    items="v-none"$'\t'"${C_DIM}·  no local folder and no known origin: clone it yourself, then ev restore -C <dir> --as $name${C_RST}"
   fi
-  items="$items"$'\n'"v-forget${t}${d}✕${r}  Forget             ${d}remove $name from the vault${r}"
+  items="$items"$'\n'"$(menu_line v-forget "✕" "Forget" "vault" "remove $name from the vault" dim)"
   choice="$(printf '%s\n' "$items" | menu_fzf "$name" "${C_BOLD}$name${C_RST} ${C_DIM}esc back${C_RST}")" || return 0
   case "$choice" in
-    v-restore) menu_run restore "$name" || true ;;
-    v-compare) menu_run status "$name" || true ;;
+    v-restore) menu_run restore -C "$dir" --as "$name" || true ;;
+    v-compare) menu_run status -C "$dir" --as "$name" || true ;;
     v-clone)
-      if confirm "git clone $origin $dir, then restore its env files?"; then
-        if git clone "$origin" "$dir"; then
-          menu_run restore -C "$dir" --as "$name" || true
+      if confirm "git clone $origin $(tildify "$target"), then restore its env files?"; then
+        if git clone "$origin" "$target"; then
+          menu_run restore -C "$target" --as "$name" || true
         else
           warn "git clone failed"
         fi
@@ -274,7 +325,12 @@ menu_preview() {
   local item="${1:-}"
   case "$item" in
     keys) preview_keys; return 0 ;;
-    sep) return 0 ;;
+    sep)
+      out "${C_BOLD}whole vault${C_RST}"
+      out ""
+      out "${C_DIM}the actions below this line work on the whole vault (every project), not only on this one${C_RST}"
+      return 0
+      ;;
     config)
       if [[ -n "${2:-}" ]]; then config_preview "$2"; else config_print; fi
       return 0
@@ -326,8 +382,8 @@ preview_keys() {
   out "    ${C_ACC}↓ restore${C_RST}  vault → project"
   out "  ${C_BOLD}VAULT${C_RST}      ${C_DIM}encrypted copies, a git repo${C_RST}"
   out "    ${C_ACC}⇅ sync${C_RST}     vault ↔ GitHub (private repo)"
-  out "    ${C_ACC}→ send${C_RST}     vault → Vercel / Cloudflare"
-  out "    ${C_ACC}← import${C_RST}   Vercel → vault (snapshots)"
+  out "    ${C_ACC}→ send${C_RST}     vault → Vercel / Cloudflare  ${C_DIM}(ev export)${C_RST}"
+  out "    ${C_ACC}← import${C_RST}   Vercel → vault (snapshots)  ${C_DIM}(ev import)${C_RST}"
 }
 
 # What applying the project file to the vault (save) or the vault file to the
@@ -366,7 +422,7 @@ key_effect() {
 preview_origin_ok() {
   if ! check_origin "$PROJECT_NAME" >/dev/null 2>&1; then
     out "${C_ERR}✗ the vault entry '$PROJECT_NAME' belongs to another repository${C_RST}"
-    out "${C_DIM}  ($(head -n 1 "$ENVORA_VAULT/$PROJECT_NAME/.origin")): run it to see how to proceed${C_RST}"
+    out "${C_DIM}  ($(entry_origin "$PROJECT_NAME")): run it to see how to proceed${C_RST}"
     out ""
     return 1
   fi
@@ -396,7 +452,7 @@ preview_save() {
   while IFS=$'\t' read -r st rel; do
     case "$st" in
       same) out "  ${C_DIM}= $rel  identical, skipped${C_RST}" ;;
-      stale) out "  ${C_WARN}↓${C_RST} $rel  ${C_DIM}newer in the vault, not edited here → skipped (use Restore)${C_RST}" ;;
+      stale) out "  ${C_WARN}↓${C_RST} $rel  ${C_DIM}newer in the vault, unchanged here since your last save/restore → skipped (use Restore)${C_RST}" ;;
       tracked) out "  ${C_DIM}· $rel  tracked by git, skipped${C_RST}" ;;
       vaultonly) out "  ${C_DIM}· $rel  only in the vault, kept there${C_RST}" ;;
     esac
@@ -483,6 +539,12 @@ EOF
   out "[SENSITIVE]. envora keeps the value of the previous snapshot when it has one.${C_RST}"
 }
 
+# The config folder an export would use (same choice as the command), or
+# nothing when it would have to ask.
+preview_pick() {
+  pick_dir "$1" "$2" 2>/dev/null </dev/null || true
+}
+
 preview_export_vercel() {
   preview_title "▲ Send to Vercel" "vault → Vercel" "add / update Vercel env vars from a file saved in the vault"
   preview_origin_ok || return 0
@@ -490,18 +552,25 @@ preview_export_vercel() {
   dirs="$(vercel_dirs)"
   if [[ -z "$dirs" ]]; then
     out "not linked to Vercel yet (no .vercel/project.json)"
+    out "${C_DIM}running it will offer 'vercel link'${C_RST}"
     return 0
   fi
-  pdir="$(printf '%s\n' "$dirs" | head -n 1)"
+  pdir="$(preview_pick Vercel "$dirs")"
+  if [[ -z "$pdir" ]]; then
+    out "several folders are linked to Vercel; running it asks which one:"
+    while IFS= read -r pdir; do out "  $(dir_label "$(rel_of_dir "$pdir")")"; done <<<"$dirs"
+    return 0
+  fi
   reldir="$(rel_of_dir "$pdir")"
+  out "  linked folder: $(dir_label "$reldir")"
   for e in production preview development; do
     f="$(in_dir "$reldir" ".env.$e")"
     if [[ -f "$ENVORA_VAULT/$PROJECT_NAME/$f.age" ]]; then
-      out "  vault/$f  ${C_ACC}→${C_RST} Vercel $e  ${C_DIM}($(decrypt_stream "$ENVORA_VAULT/$PROJECT_NAME/$f.age" 2>/dev/null | dotenv_keys | grep -c . || true) vars)${C_RST}"
+      out "  vault/$PROJECT_NAME/$f  ${C_ACC}→${C_RST} Vercel $e  ${C_DIM}($(decrypt_stream "$ENVORA_VAULT/$PROJECT_NAME/$f.age" 2>/dev/null | dotenv_keys | grep -c . || true) vars)${C_RST}"
       any=1
     fi
   done
-  [[ $any == 0 ]] && out "no .env.production / .env.preview / .env.development saved (use --file / --env from the CLI)"
+  [[ $any == 0 ]] && out "no $(in_dir "$reldir" .env.production) / .env.preview / .env.development saved (use --file / --env from the CLI)"
   out ""
   out "${C_DIM}running it reads 'vercel env ls', shows add / update / kept, and asks before"
   out "sending. Values go through stdin. Nothing is ever deleted on Vercel."
@@ -511,8 +580,14 @@ preview_export_vercel() {
 preview_export_cloudflare() {
   preview_title "☁ Send to Cloudflare" "vault → Cloudflare" "upload a saved file as Worker / Pages secrets"
   preview_origin_ok || return 0
-  local dirs d reldir file keys
+  local dirs d reldir file keys target
   dirs="$(cloudflare_dirs)"
+  d="$(preview_pick Cloudflare "$dirs")"
+  if [[ -z "$d" ]]; then
+    out "several wrangler configs in this project; running it asks which one:"
+  else
+    dirs="$d"
+  fi
   while IFS= read -r d; do
     [[ -z "$d" ]] && continue
     reldir="$(rel_of_dir "$d")"
@@ -520,10 +595,12 @@ preview_export_cloudflare() {
       out "  ${C_ERR}✗${C_RST} $(in_dir "$reldir" "$(basename "${CF_CFG:-wrangler.json}")")  ${C_DIM}cannot be read (invalid JSON?)${C_RST}"
       continue
     fi
+    target="Worker ${CF_NAME:-?} (deployed, top-level)"
+    [[ "$CF_PAGES" == 1 ]] && target="Pages project ${CF_NAME:-?} (production)"
     out "  $(cf_kind) ${C_BOLD}${CF_NAME:-?}${C_RST}  ${C_DIM}$(in_dir "$reldir" "$(basename "$CF_CFG")")${C_RST}"
     if file="$(cf_source_file "$reldir" "")"; then
       keys="$(decrypt_stream "$ENVORA_VAULT/$PROJECT_NAME/$file.age" 2>/dev/null | dotenv_keys | tr '\n' ' ')"
-      out "    vault/$file ${C_ACC}→${C_RST} $(cf_kind) ${CF_NAME:-?}"
+      out "    vault/$PROJECT_NAME/$file ${C_ACC}→${C_RST} $target"
       out "    ${C_DIM}secrets: $keys${C_RST}"
       if [[ -f "$PROJECT_DIR/$file" ]] && ! same_plaintext "$ENVORA_VAULT/$PROJECT_NAME/$file.age" "$PROJECT_DIR/$file"; then
         out "    ${C_WARN}! your local $file differs from the vault: save first?${C_RST}"
@@ -535,17 +612,20 @@ preview_export_cloudflare() {
   out ""
   out "${C_DIM}running it compares names with 'wrangler secret list', shows the plan and asks:"
   out "secrets deploy immediately. Values are piped, never written to disk."
-  out "Nothing is deleted on Cloudflare. Remote environments: ev export cloudflare --env e"
-  out "(sends .dev.vars.<env>, never your local .dev.vars unless you pass --file)${C_RST}"
+  out "Nothing is deleted on Cloudflare."
+  out "Without --env: .dev.vars goes to the deployed Worker (Pages: production)."
+  out "With --env e (CLI): .dev.vars.<e> goes to environment e.${C_RST}"
 }
 
 preview_browse() {
-  preview_title "☰ Browse vault" "vault" "every project saved in the vault"
-  local name n
+  preview_title "≡ Browse vault" "vault" "every project saved in the vault"
+  local name n dir
   while IFS= read -r name; do
     [[ -z "$name" ]] && continue
     n="$(vault_project_files "$name" | grep -c . || true)"
-    out "  $(printf '%-26s' "$name") ${C_DIM}$(plural "$n" file) · $([[ -d "$ENVORA_PROJECTS/$name" ]] && printf 'on this machine' || printf 'not on this machine')${C_RST}"
+    dir="$(local_dir_of "$name")"
+    if [[ -n "$dir" ]]; then dir="$(tildify "$dir")"; else dir="not on this machine"; fi
+    out "  $(printf '%-26s' "$name") ${C_DIM}$(plural "$n" file) · $dir${C_RST}"
   done <<EOF
 $(vault_projects)
 EOF
@@ -577,9 +657,9 @@ preview_rotate() {
 }
 
 preview_vault_entry() {
-  local name="$1" origin="" rel
+  local name="$1" origin rel dir
   valid_name "$name" || return 0
-  [[ -f "$ENVORA_VAULT/$name/.origin" ]] && origin="$(head -n 1 "$ENVORA_VAULT/$name/.origin")"
+  origin="$(entry_origin "$name")"
   out "${C_BOLD}$name${C_RST}"
   out "${C_DIM}${origin:-origin unknown} · last save $(vgit log -1 --format=%cr -- "$name" 2>/dev/null)${C_RST}"
   out ""
@@ -594,25 +674,27 @@ EOF
 $(vault_snapshot_files "$name")
 EOF
   out ""
-  if [[ -d "$ENVORA_PROJECTS/$name" ]]; then
-    out "${C_DIM}local folder: $ENVORA_PROJECTS/$name${C_RST}"
+  dir="$(local_dir_of "$name")"
+  if [[ -n "$dir" ]]; then
+    out "${C_DIM}on this machine: $(tildify "$dir")${C_RST}"
   else
-    out "${C_DIM}not on this machine ($ENVORA_PROJECTS/$name)${C_RST}"
+    out "${C_DIM}not on this machine (looked for its git origin under $(tildify "$ENVORA_PROJECTS"))${C_RST}"
   fi
 }
 
 preview_vault_restore() {
-  local name="$1" item="$2"
+  local name="$1" item="$2" dir="${ENVORA_MENU_PROJECT_DIR:-}"
   valid_name "$name" || return 0
   if [[ "$item" == v-clone ]]; then
     out "${C_BOLD}Clone + restore${C_RST}"
     out ""
-    out "  1. git clone $(head -n 1 "$ENVORA_VAULT/$name/.origin" 2>/dev/null) $ENVORA_PROJECTS/$name"
+    out "  1. git clone $(entry_origin "$name") $(tildify "$(clone_target "$name")")"
     out "  2. restore its env files from the vault:"
     vault_project_files "$name" | sed 's/^/       /'
     return 0
   fi
-  ARG_C="$ENVORA_PROJECTS/$name"
+  [[ -n "$dir" ]] || return 0
+  ARG_C="$dir"
   ARG_AS="$name"
   set_project_dir "$ARG_C" 2>/dev/null || return 0
   PROJECT_NAME="$name"
@@ -625,12 +707,17 @@ preview_vault_restore() {
 }
 
 preview_forget() {
-  local name="$1"
+  local name="$1" snaps
   valid_name "$name" || return 0
   out "${C_BOLD}✕ Forget $name${C_RST}"
   out ""
   out "removes these files from the vault (asks first):"
   vault_project_files "$name" | sed 's/^/  /'
+  snaps="$(vault_snapshot_files "$name")"
+  if [[ -n "$snaps" ]]; then
+    out "and its Vercel snapshots:"
+    printf '%s\n' "$snaps" | sed 's/^/  ▲ /'
+  fi
   out ""
   out "${C_DIM}old versions stay in git history; your project folder is not touched${C_RST}"
 }

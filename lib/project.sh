@@ -157,7 +157,10 @@ guard_project_dir() {
   home="$(abs_dir "$HOME" || printf '%s' "$HOME")"
   projects="$(abs_dir "$ENVORA_PROJECTS" || printf '%s' "$ENVORA_PROJECTS")"
   if [[ "$d" == "/" || "$d" == "$home" || "$d" == "$projects" ]]; then
-    err "$(tildify "$d") is not a project folder (it is / , your home or ENVORA_PROJECTS)"
+    local what="the root folder /"
+    [[ "$d" == "$home" ]] && what="your home folder"
+    [[ "$d" == "$projects" ]] && what="the projects root (ENVORA_PROJECTS)"
+    err "$(tildify "$d") is $what, not a project"
     say "  point -C at one project, e.g. -C $(tildify "$projects")/<name>"
     return 1
   fi
@@ -216,11 +219,16 @@ resolve_project() {
           name="$detected"
         fi
       fi
+    elif [[ -n "$(local_dir_of "$name")" ]]; then
+      # The folder has another name: found by its git origin.
+      set_project_dir "$(local_dir_of "$name")" || return 1
+      guard_project_dir || return 1
+      say "${C_DIM}'$name' lives in $(tildify "$PROJECT_DIR") on this machine${C_RST}"
     else
-      err "no local folder for '$name': it is not the current project and $ENVORA_PROJECTS/$name does not exist"
+      err "no local folder for '$name': it is not the current project and $(tildify "$ENVORA_PROJECTS/$name") does not exist"
       say "  clone it first, or pass the folder with -C <dir>"
-      if [[ -f "$ENVORA_VAULT/$name/.origin" ]]; then
-        say "  git clone $(head -n 1 "$ENVORA_VAULT/$name/.origin") $ENVORA_PROJECTS/$name"
+      if [[ -n "$(entry_origin "$name")" ]]; then
+        say "  git clone $(entry_origin "$name") $(tildify "$ENVORA_PROJECTS/$name")"
       fi
       return 1
     fi

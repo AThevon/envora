@@ -159,9 +159,9 @@ if needs_setup; then
     [[ -z "$CMD" ]] || say "now running: ev $CMD $*"
   else
     if ! vault_exists; then
-      err "envora is not set up: no vault at $ENVORA_VAULT (run 'ev init')"
+      err "envora is not set up: no vault at $(tildify "$ENVORA_VAULT") (run 'ev init')"
     else
-      err "envora is not set up: no key at $ENVORA_KEY (run 'ev init')"
+      err "envora is not set up: no key at $(tildify "$ENVORA_KEY") (run 'ev init')"
     fi
     exit 1
   fi

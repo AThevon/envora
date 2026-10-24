@@ -328,6 +328,7 @@ cmd_save() {
     commit_rc=0
     vault_commit "$msg" "$PROJECT_NAME" .recipient .gitattributes || commit_rc=$?
     [[ $commit_rc == 2 ]] && return 1
+    record_project_dir
   else
     vault_commit "envora: record the vault public key" .recipient >/dev/null || true
   fi
@@ -612,6 +613,7 @@ cmd_restore() {
     err "$(plural $((failed + refused)) file) not restored"
     return 1
   fi
+  record_project_dir
   return 0
 }
 
@@ -743,7 +745,8 @@ cmd_list() {
   while IFS= read -r name; do
     n="$(vault_project_files "$name" | grep -c . || true)"
     date="$(vgit log -1 --format=%cd --date=short -- "$name" 2>/dev/null)"
-    if [[ -d "$ENVORA_PROJECTS/$name" ]]; then where="on this machine: $(tildify "$ENVORA_PROJECTS/$name")"; else where="not on this machine"; fi
+    where="$(local_dir_of "$name")"
+    if [[ -n "$where" ]]; then where="on this machine: $(tildify "$where")"; else where="not on this machine"; fi
     snaps="$(vault_snapshot_files "$name" | sed 's|^@\([^/]*\)/.*|\1|' | LC_ALL=C sort -u | tr '\n' ' ')"
     out "  $(printf '%-24s %-9s %-11s' "$name" "$(plural "$n" file)" "${date:-unsaved}")  ${C_DIM}${where}${snaps:+ · snapshots: $snaps}${C_RST}"
   done <<EOF
@@ -794,7 +797,11 @@ cmd_forget() {
     what="$file of $name"
   else
     target="$name"
-    what="$name ($(plural "$(vault_project_files "$name" | grep -c . || true)" file))"
+    local n_snap
+    n_snap="$(vault_snapshot_files "$name" | grep -c . || true)"
+    what="$name ($(plural "$(vault_project_files "$name" | grep -c . || true)" file)"
+    [[ "$n_snap" -gt 0 ]] && what="$what + $(plural "$n_snap" "Vercel snapshot")"
+    what="$what)"
   fi
   if [[ ! -e "$ENVORA_VAULT/$target" ]]; then
     err "not in the vault: ${file:+$file of }$name"
@@ -861,7 +868,7 @@ cmd_sync() {
     return 0
   fi
   if ! vault_has_remote; then
-    err "the vault has no remote: set one with 'git -C $ENVORA_VAULT remote add origin <url>'"
+    err "the vault has no remote: set one with 'git -C $(tildify "$ENVORA_VAULT") remote add origin <url>'"
     return 1
   fi
   vault_pull || return 1

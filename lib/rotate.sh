@@ -66,7 +66,7 @@ cmd_rotate() {
     return 0
   fi
   if [[ -e "$new_key" ]]; then
-    err "$new_key already exists (left by an interrupted rotation?): check it, delete it, then retry"
+    err "$(tildify "$new_key") already exists (left by an interrupted rotation?): check it, delete it, then retry"
     return 1
   fi
   vault_release
@@ -123,7 +123,7 @@ cmd_rotate() {
   bak="$ENVORA_KEY.bak-$(now_stamp)"
   while [[ -e "$bak" ]]; do n=$((n + 1)); bak="$ENVORA_KEY.bak-$(now_stamp)-$n"; done
   if ! cp -p "$ENVORA_KEY" "$bak" || ! chmod 600 "$bak" || ! cmp -s "$ENVORA_KEY" "$bak"; then
-    err "cannot back up the old key to $bak; nothing changed"
+    err "cannot back up the old key to $(tildify "$bak"); nothing changed"
     return 1
   fi
 
@@ -131,7 +131,7 @@ cmd_rotate() {
   trap '' INT TERM HUP
   if ! mv -f "$new_key" "$ENVORA_KEY"; then
     rotate_restore_traps
-    err "cannot install the new key at $ENVORA_KEY; nothing changed (old key also kept at $bak)"
+    err "cannot install the new key at $(tildify "$ENVORA_KEY"); nothing changed (old key also kept at $(tildify "$bak"))"
     return 1
   fi
   unregister_cleanup "$new_key"
@@ -160,7 +160,7 @@ cmd_rotate() {
       err "rotation rolled back: cannot replace $mv_failed ($(head -n 1 "$TMP_ROOT/mv.err" 2>/dev/null)). Your old key and the vault are as before."
     else
       rotate_restore_traps
-      err "rotation interrupted at $mv_failed: the new key is installed, some files still use the old one ($bak)"
+      err "rotation interrupted at $mv_failed: the new key is installed, some files still use the old one ($(tildify "$bak"))"
       say "  nothing is lost: run 'ev rotate' again to finish (it reads the old key too)"
     fi
     return 1

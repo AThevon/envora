@@ -74,8 +74,9 @@ die() {
   exit 1
 }
 
+# A closed pipe (ev list | head -1) ends the command quietly.
 out() {
-  printf '%s\n' "$*"
+  printf '%s\n' "$*" 2>/dev/null || exit 0
 }
 
 has() {

@@ -620,7 +620,7 @@ t_legacy_name_and_folder_guard() {
   expect_rc 1 save -C "$T/A/home/work/" --yes
   assert_contains "$OUT" "looks like a folder of projects"
   expect_rc 1 save -C "$ENVORA_PROJECTS" --yes
-  assert_contains "$OUT" "is not a project folder"
+  assert_contains "$OUT" "is the projects root (ENVORA_PROJECTS), not a project"
   expect_rc 1 save -C "$HOME" --yes
   assert_no_file "$ENVORA_VAULT/work"
   assert_no_file "$ENVORA_VAULT/home"
@@ -1582,8 +1582,12 @@ t_menu_previews_and_items() {
   assert_contains "$out" "removes B from your file · sets A to the vault value"
   out="$(ENVORA_MENU_DIR="$p" "$TEST_BASH" "$EV" _preview export-cloudflare 2>&1)"
   assert_contains "$out" "Worker w"
-  out="$(ENVORA_MENU_PROJECT=app "$TEST_BASH" "$EV" _preview v-restore 2>&1)"
+  out="$(ENVORA_MENU_PROJECT=app ENVORA_MENU_PROJECT_DIR="$p" "$TEST_BASH" "$EV" _preview v-restore 2>&1)"
   assert_contains "$out" "differs"
+  out="$(ENVORA_MENU_DIR="$p" "$TEST_BASH" "$EV" _preview export-vercel 2>&1)"
+  assert_contains "$out" "linked folder: project root"
+  out="$(ENVORA_MENU_DIR="$p" "$TEST_BASH" "$EV" _preview sep 2>&1)"
+  assert_contains "$out" "whole vault"
   out="$(ENVORA_MENU_PROJECT=app "$TEST_BASH" "$EV" _preview v-forget 2>&1)"
   assert_contains "$out" "worker/.dev.vars"
   # menu building blocks, under the same bash
@@ -1607,7 +1611,8 @@ t_menu_previews_and_items() {
   assert_contains "$out" "Worker secrets"
   assert_contains "$out" "Rotate key"
   assert_contains "$out" "p:app"
-  assert_contains "$out" "on this machine"
+  assert_contains "$out" "~/projects/app"
+  assert_contains "$out" "─── whole vault"
 }
 
 t_symlink_install() {
@@ -1819,6 +1824,37 @@ t_sync_interrupt_never_leaves_a_merge() {
   assert_eq "$(git -C "$ENVORA_VAULT" status --porcelain)" ""
 }
 
+t_forget_while_another_machine_saves() {
+  local key="$T/A/home/.age/key.txt" p pb x
+  p="$(mkproject app)"
+  printf 'A=1\n' >"$p/.env"
+  (cd "$p" && expect_rc 0 save -q -y)
+  new_machine B "$key"
+  pb="$(mkproject app)"
+  (cd "$pb" && expect_rc 0 restore -q -y)
+  printf 'A=2\n' >"$pb/.env"
+  (cd "$pb" && expect_rc 3 save -q -y --no-sync)
+  x="$(git -C "$ENVORA_VAULT" rev-parse HEAD)"
+  git -C "$ENVORA_VAULT" push -q origin HEAD:refs/heads/side
+  cat >"$T/remote.git/hooks/pre-receive" <<HOOK
+#!/bin/sh
+if [ ! -f "$T/raced" ]; then
+  touch "$T/raced"
+  unset GIT_QUARANTINE_PATH
+  git update-ref refs/heads/main $x
+  exit 1
+fi
+exit 0
+HOOK
+  chmod +x "$T/remote.git/hooks/pre-receive"
+  use_machine A
+  expect_rc 1 forget app --yes
+  assert_contains "$OUT" "another machine saved app while it was being removed"
+  assert_not_contains "$OUT" "removed app"
+  assert_file "$ENVORA_VAULT/app/.env.age"
+  assert_eq "$(cat "$ENVORA_VAULT/app/.origin")" "git@github.com:me/app.git"
+}
+
 t_unicode_and_quote_paths_sync() {
   local key="$T/A/home/.age/key.txt" p pb d
   p="$(mkproject app)"
@@ -1887,58 +1923,6 @@ t_init_wrong_key_on_vault_without_recipient() {
   assert_not_contains "$OUT" "no identity matched"
 }
 
-t_killed_runs_leave_no_plaintext() {
-  local p d pid
-  p="$(mkproject app)"
-  printf 'A=1\n' >"$p/.env"
-  (cd "$p" && expect_rc 0 save -q -y)
-  # a temp dir of a run killed with SIGKILL (fzf does that to previews)
-  sh -c 'exit 0' &
-  pid=$!
-  wait "$pid"
-  d="$TMPDIR/envora.KILLED"
-  mkdir -p "$d"
-  printf '%s\n' "$pid" >"$d/.pid"
-  printf 'A=1\n' >"$d/snap.plain"
-  expect_rc 0 help
-  assert_no_file "$d"
-  # the save / restore previews never write a decrypted copy to disk
-  printf 'A=2\n' >"$p/.env"
-  ENVORA_MENU_DIR="$p" "$TEST_BASH" "$EV" _preview save >/dev/null 2>&1 </dev/null
-  assert_eq "$(grep -rl 'A=1' "$TMPDIR" 2>/dev/null | grep -v '\.age$' || true)" ""
-}
-
-t_forget_while_another_machine_saves() {
-  local key="$T/A/home/.age/key.txt" p pb x
-  p="$(mkproject app)"
-  printf 'A=1\n' >"$p/.env"
-  (cd "$p" && expect_rc 0 save -q -y)
-  new_machine B "$key"
-  pb="$(mkproject app)"
-  (cd "$pb" && expect_rc 0 restore -q -y)
-  printf 'A=2\n' >"$pb/.env"
-  (cd "$pb" && expect_rc 3 save -q -y --no-sync)
-  x="$(git -C "$ENVORA_VAULT" rev-parse HEAD)"
-  git -C "$ENVORA_VAULT" push -q origin HEAD:refs/heads/side
-  cat >"$T/remote.git/hooks/pre-receive" <<HOOK
-#!/bin/sh
-if [ ! -f "$T/raced" ]; then
-  touch "$T/raced"
-  unset GIT_QUARANTINE_PATH
-  git update-ref refs/heads/main $x
-  exit 1
-fi
-exit 0
-HOOK
-  chmod +x "$T/remote.git/hooks/pre-receive"
-  use_machine A
-  expect_rc 1 forget app --yes
-  assert_contains "$OUT" "another machine saved app while it was being removed"
-  assert_not_contains "$OUT" "removed app"
-  assert_file "$ENVORA_VAULT/app/.env.age"
-  assert_eq "$(cat "$ENVORA_VAULT/app/.origin")" "git@github.com:me/app.git"
-}
-
 t_envoraignore_and_dependency_dirs() {
   local p
   p="$(mkproject php)"
@@ -1958,6 +1942,60 @@ t_envoraignore_and_dependency_dirs() {
   expect_rc 0 save -y
   assert_contains "$OUT" "skipped (.envoraignore): fixtures/.env.test"
   assert_no_file "$ENVORA_VAULT/php/fixtures/.env.test.age"
+}
+
+t_list_and_browse_follow_the_origin() {
+  local p q out
+  # folder foo holds repo bar; folder qux holds repo foo
+  p="$(mkproject foo "git@github.com:me/bar.git")"
+  printf 'B=1\n' >"$p/.env"
+  (cd "$p" && expect_rc 0 save -q -y)
+  q="$(mkproject qux "git@github.com:me/foo.git")"
+  printf 'F=1\n' >"$q/.env"
+  (cd "$q" && expect_rc 0 save -q -y)
+  rm -rf "$XDG_STATE_HOME/envora/dirs"
+  expect_rc 0 list
+  assert_contains "$OUT" "bar"
+  assert_contains "$(printf '%s\n' "$OUT" | grep '^  bar')" "on this machine: ~/projects/foo"
+  assert_contains "$(printf '%s\n' "$OUT" | grep '^  foo')" "on this machine: ~/projects/qux"
+  # ev list | head never prints a broken pipe error
+  out="$("$TEST_BASH" "$EV" list 2>&1 </dev/null | head -n 1)"
+  out="$( ("$TEST_BASH" "$EV" list | head -n 1 >/dev/null) 2>&1 </dev/null)"
+  assert_not_contains "$out" "Broken pipe"
+  # restore NAME finds the folder by its origin when ~/projects/NAME is missing
+  rm "$p/.env"
+  mv "$p" "$ENVORA_PROJECTS/renamed"
+  cd "$T"
+  expect_rc 0 restore bar -y
+  assert_contains "$OUT" "'bar' lives in ~/projects/renamed"
+  assert_eq "$(cat "$ENVORA_PROJECTS/renamed/.env")" "B=1"
+  # forget counts the Vercel snapshots it removes
+  mkdir -p "$ENVORA_VAULT/bar/@vercel"
+  printf 'S=1\n' | age -r "$(age-keygen -y "$ENVORA_KEY")" -o "$ENVORA_VAULT/bar/@vercel/production.env.age"
+  git -C "$ENVORA_VAULT" add -A && git -C "$ENVORA_VAULT" commit -qm snap
+  expect_rc 0 forget bar --yes
+  assert_contains "$OUT" "removed bar (1 file + 1 Vercel snapshot)"
+}
+
+t_killed_runs_leave_no_plaintext() {
+  local p d pid
+  p="$(mkproject app)"
+  printf 'A=1\n' >"$p/.env"
+  (cd "$p" && expect_rc 0 save -q -y)
+  # a temp dir of a run killed with SIGKILL (fzf does that to previews)
+  sh -c 'exit 0' &
+  pid=$!
+  wait "$pid"
+  d="$TMPDIR/envora.KILLED"
+  mkdir -p "$d"
+  printf '%s\n' "$pid" >"$d/.pid"
+  printf 'A=1\n' >"$d/snap.plain"
+  expect_rc 0 help
+  assert_no_file "$d"
+  # the save / restore previews never write a decrypted copy to disk
+  printf 'A=2\n' >"$p/.env"
+  ENVORA_MENU_DIR="$p" "$TEST_BASH" "$EV" _preview save >/dev/null 2>&1 </dev/null
+  assert_eq "$(grep -rl 'A=1' "$TMPDIR" 2>/dev/null | grep -v '\.age$' || true)" ""
 }
 
 # --- run ---------------------------------------------------------------------

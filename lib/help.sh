@@ -22,29 +22,29 @@ ${b}envora${r} ${d}v$VERSION · encrypted vault for your untracked .env files${r
 $(help_diagram)
 
 ${b}PROJECT ↔ VAULT${r}
-  ${a}ev save${r}      [-C dir] [--as name]   project → vault    encrypt this project's env files, commit, push
-  ${a}ev restore${r}   [name] [--force]       vault → project    write the saved files back (asks before overwriting)
-  ${a}ev status${r}    [name] [--values]      project ↔ vault    what differs, key names only (--values: real diff)
+  ${a}ev save${r}     [-C dir] [--as name]      project → vault      encrypt this project's env files, commit, push
+  ${a}ev restore${r}  [name] [--force]          vault → project      write the saved files back (asks before overwriting)
+  ${a}ev status${r}   [name] [--values]         project ↔ vault      what differs, key names only (--values: real diff)
 
 ${b}VAULT${r}
-  ${a}ev list${r}                             vault              every project in the vault
-  ${a}ev forget${r}    <name> [file]          vault              remove a project (or one file) from the vault
+  ${a}ev list${r}                               vault                every project in the vault
+  ${a}ev forget${r}   <name> [file]             vault                remove a project (or one file) from the vault
 
 ${b}VAULT ↔ GITHUB${r}
-  ${a}ev sync${r}                             vault ↔ GitHub     pull, merge, push; reports what moved
+  ${a}ev sync${r}                               vault ↔ GitHub       pull, merge, push; reports what moved
 
 ${b}VAULT ↔ PLATFORMS${r}
-  ${a}ev import vercel${r}   [--env e]        Vercel → vault     snapshot Vercel env vars into the vault
-  ${a}ev export cloudflare${r} [--env e]      vault → Cloudflare upload secrets to the Worker / Pages project
-  ${a}ev export vercel${r}   [--env e]        vault → Vercel     add / update Vercel env vars
+  ${a}ev import vercel${r}      [--env e]       Vercel → vault       snapshot Vercel env vars into the vault
+  ${a}ev export vercel${r}      [--env e]       vault → Vercel       add / update Vercel env vars
+  ${a}ev export cloudflare${r}  [--env e]       vault → Cloudflare   upload secrets to the Worker / Pages project
 
 ${b}MAINTENANCE${r}
-  ${a}ev${r}                                  interactive menu with a live preview of every action
-  ${a}ev doctor${r}                           check the setup, with a fix for each problem
-  ${a}ev rotate${r}    [--pq]                 new key, re-encrypt everything
-  ${a}ev init${r}                             first-time or new-machine setup
-  ${a}ev config${r}    [get|set ...]          settings (~/.envorarc)
-  ${a}ev help${r}      <command>              details for one command
+  ${a}ev${r}                                    interactive menu with a live preview of every action
+  ${a}ev doctor${r}                             check the setup, with a fix for each problem
+  ${a}ev rotate${r}   [--pq]                    new key, re-encrypt everything
+  ${a}ev init${r}                               first-time or new-machine setup
+  ${a}ev config${r}   [get|set ...]             settings (~/.envorarc)
+  ${a}ev help${r}     <command>                 details for one command
 
 ${b}GLOBAL FLAGS${r} ${d}(anywhere on the line)${r}
   -y, --yes      no prompts, safe defaults (backups before overwriting)
@@ -80,14 +80,18 @@ Encrypts the env files of the project into the vault, commits and pushes to GitH
     git history and a warning names its commit)
 
 Project name: --as, else the git origin repo name, else the main worktree folder.
-The vault entry remembers its origin URL: a different repo with the same name, or a
-folder without a git origin, is refused (--as NAME says it really is that project).
+The vault entry remembers its origin URL (credentials removed): a different repo with
+the same name, or a folder without a git origin, is refused, also with --as. When it
+really is that project (repo renamed or moved): --force, which records the new origin.
+
+Env files you do not want saved (fixtures, copies in build/): list them in a
+.envoraignore file at the project root, one pattern per line (e.g. dist/, */fixtures/*).
 
 ${b}exit codes${r} (for scripts, e.g. before deleting a folder)
   0 every env file of the folder is in the vault AND pushed to GitHub (or nothing to save)
   3 saved and committed locally but NOT pushed (offline / rejected): decide yourself
-  1 failure, or env files envora does not reach (deeper than 4 levels, inside build/,
-    dist/, vendor/) or not saved: nothing is guaranteed, do not delete anything
+  1 failure, or env files envora does not reach (deeper than 4 levels, inside build/
+    or dist/) or not saved: nothing is guaranteed, do not delete anything
 
 ${d}example: ev save -C ~/projects/app --yes --quiet${r}
 EOF
@@ -101,12 +105,15 @@ Writes the saved env files back into the project.
   · a newer version saved by another machine replaces a copy you did not edit
   · a local file you edited is shown (key names only) and you are asked
   · with --yes, --force or without a terminal: the local file is backed up first
-    (encrypted, ~/.local/state/envora/backups/<project>/, last 10 kept), then replaced
+    (encrypted, ~/.local/state/envora/backups/<project>/, last 10 kept), then replaced;
+    --quiet still prints one warning line per replaced file
   · each file is written atomically with mode 600
   · only env file names are restored, never outside the project folder
-  · refused when the vault entry belongs to another repository (--as NAME to force)
+  · refused when the vault entry belongs to another repository (--force if it really
+    is that project, e.g. a fork you work on)
 
-NAME outside the project: uses \$ENVORA_PROJECTS/NAME ($ENVORA_PROJECTS).
+NAME outside the project: uses \$ENVORA_PROJECTS/NAME ($(tildify "$ENVORA_PROJECTS")), else the
+folder where NAME was last saved or restored, or whose git origin matches it.
 Exit 0 also when there is nothing to restore.
 Read a backup: age -d -i $(tildify "$ENVORA_KEY") <backup>.age (made before a rotation:
 use the <key>.bak-<date> kept by ev rotate).
@@ -164,17 +171,21 @@ EOF
       case "$sub" in
         vercel)
           cat <<EOF
-${b}ev export vercel${r} [--env e] [--file f] [--dry-run] [-C dir]        ${a}vault → Vercel${r}
+${b}ev export vercel${r} [--env e] [--file f] [--dry-run] [--update-shared] [-C dir]   ${a}vault → Vercel${r}
 
 Sends a saved file from the vault to Vercel.
   · default mapping: .env.production → production, .env.preview → preview,
     .env.development → development (otherwise --file and --env)
   · plan by names against 'vercel env ls': add (new), update (existing), kept (only on Vercel)
   · values go through stdin, never on the command line; nothing is deleted
-  · a variable that also serves other environments is skipped unless you confirm
-    (or --update-shared): updating it changes them all
-  · skipped too: keys with branch-specific values, empty values, values over 60 KB
+  · a variable that also serves other environments (custom ones included) is skipped
+    unless you confirm (or --update-shared): updating it changes them all
+  · skipped too: keys with branch-specific values, empty values, values over 60 KB,
+    names that are not valid variable names
+  · values are sent as written: \$OTHER is not expanded (the plan points them out)
   · asks before applying (--yes to skip, --dry-run to only show the plan)
+  · monorepos: the linked folder around the current folder is used, else -C <dir>
+Uses 'vercel' from PATH, else npx vercel@$VERCEL_PINNED (override: ENVORA_VERCEL_CMD).
 EOF
           ;;
         *)
@@ -182,15 +193,18 @@ EOF
 ${b}ev export cloudflare${r} [--env e] [--file f] [--dry-run] [-C dir]        ${a}vault → Cloudflare${r}
 
 Uploads a saved file from the vault as Worker (or Pages) secrets.
-  · source: .dev.vars, else .env; with --env e: .dev.vars.<e>, else .env.<e>
-    (never your local .dev.vars unless you pass --file)
+  · without --env: .dev.vars (else .env) goes to the deployed, top-level Worker
+    (Pages: production)
+  · with --env e: .dev.vars.<e> (else .env.<e>) goes to environment e;
+    --file f sends any other saved file
   · warns when your local file differs from the vault copy (save first?)
   · plan by names against 'wrangler secret list': add, update, only on Cloudflare (kept)
   · secrets are piped as JSON to 'wrangler secret bulk' (never written to disk);
     Pages projects use 'wrangler pages secret bulk' (production / preview)
   · this deploys immediately: asks first (--yes to skip, --dry-run for the plan only)
-  · monorepos: runs wrangler in the folder holding wrangler.toml / wrangler.json(c);
-    the one around the current folder is picked, else -C <dir>
+  · monorepos: the wrangler config around the current folder is used (else -C <dir>),
+    and named explicitly (--config / --project-name): wrangler would otherwise pick a
+    wrangler.json from a parent folder
 Uses 'wrangler' from PATH, else npx wrangler@$WRANGLER_PINNED (override: ENVORA_WRANGLER_CMD).
 
 See also: ev export vercel
@@ -254,6 +268,8 @@ Settings live in ~/.envorarc; ENVORA_* environment variables override them.
   repo          ENVORA_REPO       ${ENVORA_REPO:-(not set)}
   vercel-cmd    ENVORA_VERCEL_CMD
   wrangler-cmd  ENVORA_WRANGLER_CMD
+The rc file holds KEY=VALUE lines; it is read, never executed. The *-cmd settings are
+split on spaces (no quotes): for anything fancier, point them at a small script.
 EOF
       ;;
     *)

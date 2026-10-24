@@ -87,7 +87,7 @@ ev                           # interactive menu with a live preview of every act
 
 | Command | Direction | What it does |
 |---|---|---|
-| `ev list` | vault | Every project: number of files, last save, whether it is on this machine (under `~/projects`), platform snapshots. |
+| `ev list` | vault | Every project: number of files, last save, where it lives on this machine (found by its git origin, not by the folder name), platform snapshots. |
 | `ev forget [name] [file]` | vault | Removes a project or one file from the vault (asks first; without a name, a picker). Old versions stay in git history. |
 
 ### VAULT ↔ GITHUB
@@ -125,20 +125,22 @@ Run `ev` inside a project:
 
 ```
  victordenay  3 files saved · 1 to save
- ✓ synced with GitHub · ? help
- › ↑  Save               project → vault     encrypt env files        │ ↑ Save   project → vault
-   ↓  Restore            vault → project     write them back          │   ~ .env  changed here → replaces the vault copy
-   ≈  Compare            project ↔ vault     key names only           │       adds STRIPE_KEY to the vault · updates DB_URL
-   ☁  Send to Cloudflare vault → Cloudflare  Worker secrets           │   = apps/web/.env.local  identical, skipped
-   ──────────────────────────────────────────                         │
-   ☰  Browse vault       every saved project                          │ then: commit in the vault and push to GitHub
-   ⇅  Sync with GitHub   vault ↔ GitHub                               │
+ vault: ✓ synced with GitHub · ? keys
+ › ↑  Save                project → vault     encrypt env files     │ ↑ Save   project → vault
+   ↓  Restore             vault → project     write them back here  │   ~ .env  changed here → replaces the vault copy
+   ≈  Compare             project ↔ vault     key names only        │       adds STRIPE_KEY to the vault · updates DB_URL
+   ☁  Send to Cloudflare  vault → Cloudflare  Worker secrets        │   = apps/web/.env.local  identical, skipped
+   ──────────────────────────────── whole vault                     │
+   ≡  Browse vault        vault               every saved project   │ then: commit in the vault and push to GitHub
+   ⇅  Sync with GitHub    vault ↔ GitHub      pull + push now       │
    ...
 ```
 
 The preview next to each action is a live plan for this project: which files would be written, replaced or skipped and why, what happens to each key (added, dropped, updated: names only, never values), where things go. Vercel items appear when the project is linked (or has a snapshot), the Cloudflare item when a `wrangler.toml` / `wrangler.json(c)` exists. Press `?` for the keys and the symbols. After an action, its report stays on screen until you press a key, then the menu comes back on the same item.
 
-Outside a project, the menu lets you browse the vault and **clone + restore** a project that is not on this machine yet (envora remembers each project's origin URL).
+If the sync with GitHub had something to say when the menu opens (offline, a conflict resolved between two machines), it is shown first. In a monorepo, Send to Vercel / Cloudflare use the config around the folder you started `ev` from, like the CLI.
+
+Outside a project, the menu lets you browse the vault and **clone + restore** a project that is not on this machine yet (envora remembers each project's origin URL). A project is "on this machine" when a folder under `~/projects` has its git origin, whatever the folder is called.
 
 ## What gets saved
 
@@ -146,8 +148,8 @@ Outside a project, the menu lets you browse the vault and **clone + restore** a 
 - Never: `*.example`, `*.sample`, `*.template`, `*.dist`, `*.defaults`, `.envrc`.
 - Files tracked by git are skipped (git already has them) and reported. `ev doctor` also warns about env files that are not ignored by git.
 - Symlinks to regular files are followed.
-- Env files the scan does not reach (deeper than 4 levels, or inside `build/`, `dist/`, `vendor/`) are listed after a save, which then exits 1: the folder is not safe to delete.
-- Stored as `vault/<project>/<path>.age`. The project name is the git origin repo name (so worktrees and renamed folders map to the same entry), else the main worktree folder name, or `--as name`. `ev save victor` (a folder under `~/projects`) still uses the folder's git identity. Each entry remembers its origin URL: saving, restoring or exporting from another repo with the same name, or from a folder without a git origin, is refused (`--as name` says it really is that project).
+- Env files the scan does not reach (deeper than 4 levels, or inside `build/` or `dist/`) are listed after a save, which then exits 1: the folder is not safe to delete. Move them, delete them, or list them in a `.envoraignore` at the project root (one pattern per line, e.g. `build/` or `*/fixtures/*`): listed files are neither saved nor reported. Dependency folders (`node_modules`, `vendor`) never count.
+- Stored as `vault/<project>/<path>.age`. The project name is the git origin repo name (so worktrees and renamed folders map to the same entry), else the main worktree folder name, or `--as name`. `ev save victor` (a folder under `~/projects`) still uses the folder's git identity. Each entry remembers its origin URL (any `user:token@` part is removed first): saving, restoring or exporting from another repo with the same name, or from a folder without a git origin, is refused, also with `--as` (which only names the entry). When it really is that project, for example after the repo was renamed or moved to an organization, add `--force`: `ev save --force` also records the new origin. GitHub, GitLab and Bitbucket origins are compared without case.
 
 ## Two machines
 
@@ -166,7 +168,7 @@ envora is safe to call from scripts. The contract:
 | `ev restore -C <dir> --yes --quiet` | `0` restored, or nothing to restore (prints nothing). Non-zero only on real errors. |
 | `ev save -C <dir> --yes --quiet` | `0` every env file of the folder is in the vault (or there is none) **and** the vault is pushed to GitHub. `3` saved and committed locally but **not** pushed (offline, rejected): you decide. `1` failure, or env files envora does not reach: nothing is guaranteed, do not delete. |
 
-In quiet mode, errors and warnings still go to stderr, one line each. A restore into a clone of someone else's repository that has the same name as one of yours is refused (exit 1): the secrets of your project never land in it. `-C` refuses `/`, your home, `~/projects` itself and folders that contain several repositories, so a wrong argument cannot save (or let you delete) a whole tree.
+In quiet mode, errors and warnings still go to stderr, one line each (a restore that replaces a file you had edited says so, with the backup location). A restore into a clone of someone else's repository that has the same name as one of yours is refused (exit 1): the secrets of your project never land in it. `-C` refuses `/`, your home, `~/projects` itself and folders that contain several repositories, so a wrong argument cannot save (or let you delete) a whole tree.
 
 ```zsh
 # clone a repo into ~/projects and bring its env files back
@@ -204,15 +206,17 @@ Both platforms treat secrets as **write-only**: you can set them, list their nam
 - Vercel **Secret** (sensitive) variables come back as `[SENSITIVE]`. envora keeps the value from the previous snapshot when it has one (and says how many values were carried over, since they may have changed on Vercel), and tells you how many values remain unknown. Put the real values in your project files and `ev save` them.
 - Snapshots are never written into your project. `ev status` lists them and compares them with your `.env.<env>`; `ev status --values` shows their contents.
 - `ev export vercel` compares names with `vercel env ls <env> --format json`, then runs `vercel env add` (new) or `vercel env update` (existing) with the value on **stdin**, never on the command line. Readable values that are already identical are skipped. Nothing is ever deleted.
-- One Vercel variable often serves several environments (production, preview, development): updating it for one changes them all. Such variables are shown apart and only updated if you confirm (or pass `--update-shared`). Keys that also have branch-specific values, empty values (the CLI cannot receive them) and values over 60 KB are listed and left for the dashboard.
+- One Vercel variable often serves several environments (production, preview, development, custom ones): updating it for one changes them all. Such variables are shown apart and only updated if you confirm (or pass `--update-shared`). Keys that also have branch-specific values, empty values (the CLI cannot receive them), values over 60 KB and names that are not variable names are listed and left alone.
+- Values are sent as written: `API=$BASE/api` reaches Vercel literally (Next.js expands `$BASE` locally, Vercel does not). The plan points such values out.
+- Every `vercel` call runs with `--non-interactive`, so a prompt can never swallow a value silently.
 - Projects linked with `vercel link` (`.vercel/project.json`) or `vercel link --repo` (`.vercel/repo.json`) are recognised. envora uses `vercel` from your PATH, else `npx -y vercel@58.4.0` (`ENVORA_VERCEL_CMD` overrides). If the project is not linked, it offers `vercel link`.
 
 ### Cloudflare
 
-- `ev export cloudflare` takes the saved `.dev.vars` (else `.env`) from the vault, or with `--env e` the saved `.dev.vars.<e>` (else `.env.<e>`): your local development file is never sent to a remote environment unless you pass `--file`. It warns if your local file differs from the vault copy, compares names with `wrangler secret list`, shows the plan (add / update / only on Cloudflare, never deleted), asks (secrets deploy immediately), then pipes a JSON object to `wrangler secret bulk`. The values never touch the disk or the command line.
-- Values are read with the same rules as wrangler and Next.js (the `dotenv` package): what you send is what `wrangler dev` reads locally.
-- Pages projects (`pages_build_output_dir` in the config) use `wrangler pages secret bulk` (environments: production, preview); wrangler reads the project name from the config itself. `wrangler.jsonc` comments and trailing commas are handled.
-- In a monorepo, wrangler runs in the folder that holds the wrangler config; run envora from inside that folder, or pass `-C <dir>`.
+- `ev export cloudflare` without `--env` takes the saved `.dev.vars` (else `.env`) and sends it to the **deployed, top-level Worker** (Pages: production); the plan and the prompt say so. With `--env e` it takes the saved `.dev.vars.<e>` (else `.env.<e>`) for environment `e`; `--file` picks any other saved file. It warns if your local file differs from the vault copy, compares names with `wrangler secret list`, shows the plan (add / update / only on Cloudflare, never deleted), asks (secrets deploy immediately), then pipes a JSON object to `wrangler secret bulk`. The values never touch the disk or the command line.
+- Values are read with the same rules as wrangler (the `dotenv` package, `KEY=value` and `KEY: value`, no `$VAR` expansion): what you send is what `wrangler dev` reads locally.
+- Pages projects (`pages_build_output_dir` in the config) use `wrangler pages secret bulk --project-name <name>` (environments: production, preview). `wrangler.jsonc` comments and trailing commas are handled.
+- In a monorepo, envora uses the wrangler config around the current folder (or `-C <dir>`), runs wrangler in that folder and names the config explicitly (`--config`): on its own, wrangler would pick a `wrangler.json` from a parent folder.
 - Cloudflare secrets cannot be imported: there is no way to read them back.
 - envora uses `wrangler` from your PATH, else `npx -y wrangler@4.132.0` (`ENVORA_WRANGLER_CMD` overrides).
 
@@ -262,8 +266,8 @@ Be clear about what this protects:
 | `ENVORA_KEY` | `~/.age/key.txt` | your age key |
 | `ENVORA_PROJECTS` | `~/projects` | where `ev restore NAME` looks for `NAME` |
 | `ENVORA_REPO` | set by `ev init` | the vault's GitHub repo (`user/name`) |
-| `ENVORA_VERCEL_CMD` | `vercel` or pinned `npx` | command used for Vercel |
-| `ENVORA_WRANGLER_CMD` | `wrangler` or pinned `npx` | command used for Cloudflare |
+| `ENVORA_VERCEL_CMD` | `vercel` or pinned `npx` | command used for Vercel (words split on spaces, no quotes: use a small script for anything else) |
+| `ENVORA_WRANGLER_CMD` | `wrangler` or pinned `npx` | command used for Cloudflare (same rule) |
 
 ## Development
 
