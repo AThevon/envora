@@ -31,7 +31,7 @@ cmd_rotate() {
     err "$new_key already exists (left by an interrupted rotation?): check it, delete it, then retry"
     return 1
   fi
-  if ! confirm "Create a new key and re-encrypt the $(plural "$total" file) of the vault?"; then
+  if ! confirm "Create a new key and re-encrypt the $(plural "$total" file) of the vault?" no; then
     if is_interactive; then say "cancelled"; return 0; fi
     err "refusing to rotate without confirmation: add --yes"
     return 1

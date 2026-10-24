@@ -66,11 +66,10 @@ in_dir() {
   if [[ "$1" == "." ]]; then printf '%s' "$2"; else printf '%s/%s' "$1" "$2"; fi
 }
 
-# pick_dir "label" dirs-on-stdin -> chosen absolute dir
+# pick_dir "label" "dirs (one per line)" -> chosen absolute dir
 # Uses -C <dir> when it is one of them, else the only one, else asks.
 pick_dir() {
-  local label="$1" list cand c_abs="" count
-  list="$(cat)"
+  local label="$1" list="$2" cand c_abs="" count
   [[ -n "$list" ]] || return 1
   count="$(printf '%s\n' "$list" | grep -c .)"
   if [[ -n "${ARG_C:-}" ]]; then

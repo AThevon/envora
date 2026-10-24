@@ -75,7 +75,7 @@ cloudflare_export() {
     err "no wrangler.toml / wrangler.json / wrangler.jsonc in this project"
     return 1
   fi
-  cfdir="$(printf '%s\n' "$dirs" | pick_dir Cloudflare)" || return 1
+  cfdir="$(pick_dir Cloudflare "$dirs")" || return 1
   reldir="$(rel_of_dir "$cfdir")"
   cfg="$(cf_config_file "$cfdir")"
   cf_is_pages "$cfg" && pages=1

@@ -83,7 +83,7 @@ vercel_import() {
     vercel_not_linked || return 1
     dirs="$(vercel_dirs)"
   fi
-  pdir="$(printf '%s\n' "$dirs" | pick_dir Vercel)" || return 1
+  pdir="$(pick_dir Vercel "$dirs")" || return 1
   reldir="$(rel_of_dir "$pdir")"
   provider_cmd vercel || return 1
 
@@ -179,7 +179,7 @@ vercel_export() {
     vercel_not_linked || return 1
     dirs="$(vercel_dirs)"
   fi
-  pdir="$(printf '%s\n' "$dirs" | pick_dir Vercel)" || return 1
+  pdir="$(pick_dir Vercel "$dirs")" || return 1
   reldir="$(rel_of_dir "$pdir")"
   local base="$ENVORA_VAULT/$PROJECT_NAME" file="$P_FILE" env="$P_ENV"
 

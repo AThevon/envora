@@ -22,7 +22,7 @@ install_key_from_text() {
   chmod 600 "$ENVORA_KEY.envora-tmp"
   mv -f "$ENVORA_KEY.envora-tmp" "$ENVORA_KEY"
   KEY_PUB="$pub"
-  ok "key saved to $ENVORA_KEY ($(printf '%.20s' "$pub")...)"
+  ok "key saved to $(tildify "$ENVORA_KEY") ($(printf '%.20s' "$pub")...)"
 }
 
 init_import_key() {
@@ -78,7 +78,7 @@ repo_clone_url() {
 init_clone() {
   local repo="$1" re='^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$'
   mkdir -p "$(dirname "$ENVORA_VAULT")" || return 1
-  step "cloning $repo into $ENVORA_VAULT"
+  step "cloning $repo into $(tildify "$ENVORA_VAULT")"
   if [[ "$repo" =~ $re ]] && has gh && gh auth status >/dev/null 2>&1; then
     gh repo clone "$repo" "$ENVORA_VAULT" -- -q 2>"$TMP_ROOT/clone.err" || {
       err "cannot clone $repo: $(tail -n 1 "$TMP_ROOT/clone.err")"
@@ -154,7 +154,7 @@ run_init() {
     shift
   done
 
-  say "${C_BOLD}1. your key${C_RST}  ${C_DIM}$ENVORA_KEY${C_RST}"
+  say "${C_BOLD}1. your key${C_RST}  ${C_DIM}$(tildify "$ENVORA_KEY")${C_RST}"
   if key_exists; then
     require_key || return 1
     ok "key found ($(printf '%.20s' "$KEY_PUB")...)"
@@ -181,7 +181,7 @@ run_init() {
   fi
 
   say ""
-  say "${C_BOLD}2. your vault${C_RST}  ${C_DIM}$ENVORA_VAULT${C_RST}"
+  say "${C_BOLD}2. your vault${C_RST}  ${C_DIM}$(tildify "$ENVORA_VAULT")${C_RST}"
   if vault_exists; then
     ok "vault found"
     if [[ -z "$ENVORA_REPO" ]]; then
@@ -216,6 +216,6 @@ run_init() {
 
   save_config || warn "cannot write $(config_rc_path)"
   say ""
-  ok "envora is ready: vault $ENVORA_VAULT${ENVORA_REPO:+ ($ENVORA_REPO)}"
+  ok "envora is ready: vault $(tildify "$ENVORA_VAULT")${ENVORA_REPO:+ ($ENVORA_REPO)}"
   return 0
 }

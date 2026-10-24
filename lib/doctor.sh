@@ -36,7 +36,7 @@ cmd_doctor() {
   if has gh; then doc_ok "gh (optional, used by ev init)"; else doc_info "gh not installed (optional, used by ev init)"; fi
 
   out ""
-  out "${C_BOLD}key${C_RST}  ${C_DIM}$ENVORA_KEY${C_RST}"
+  out "${C_BOLD}key${C_RST}  ${C_DIM}$(tildify "$ENVORA_KEY")${C_RST}"
   local key_ok=0
   if ! key_exists; then
     doc_bad "no key file" "ev init (import your key from your password manager)"
@@ -52,7 +52,7 @@ cmd_doctor() {
   fi
 
   out ""
-  out "${C_BOLD}vault${C_RST}  ${C_DIM}$ENVORA_VAULT${C_RST}"
+  out "${C_BOLD}vault${C_RST}  ${C_DIM}$(tildify "$ENVORA_VAULT")${C_RST}"
   if ! vault_exists; then
     doc_bad "no vault git repo" "ev init"
   else
@@ -90,7 +90,7 @@ cmd_doctor() {
 
   if detect_current_project 2>/dev/null; then
     out ""
-    out "${C_BOLD}project${C_RST}  ${C_DIM}$PROJECT_NAME · $PROJECT_DIR${C_RST}"
+    out "${C_BOLD}project${C_RST}  ${C_DIM}$PROJECT_NAME · $(tildify "$PROJECT_DIR")${C_RST}"
     scan_project "$PROJECT_DIR"
     local rel n=0
     while IFS= read -r rel; do

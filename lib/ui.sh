@@ -74,14 +74,16 @@ is_interactive() {
   [[ "${ASSUME_YES:-0}" != 1 && -t 0 && -t 2 ]]
 }
 
-# confirm "question" -> 0 for yes. With --yes: yes. Without a TTY: no.
+# confirm "question" [no] -> 0 for yes. With --yes: yes. Without a TTY: no.
+# A second argument "no" makes No the preselected answer.
 confirm() {
-  local q="$1"
+  local q="$1" def="true"
+  [[ "${2:-}" == no ]] && def="false"
   [[ "${ASSUME_YES:-0}" == 1 ]] && return 0
   is_interactive || return 1
   if has gum; then
-    gum confirm --prompt.foreground="#6fcf7c" --selected.background="#6fcf7c" \
-      --selected.foreground="#131518" "$q" </dev/tty
+    gum confirm --default="$def" --prompt.foreground="#6fcf7c" \
+      --selected.background="#2b3a2e" --selected.foreground="#6fcf7c" "$q" </dev/tty
   else
     local a=""
     printf '%s [y/N] ' "$q" >&2

@@ -291,7 +291,8 @@ cmd_restore() {
   fi
 
   local st rel written=() skipped_same=0 kept=0 failed=0 backed=0 bad=0 overwrite
-  while IFS=$'\t' read -r st rel; do
+  # The plan is read on fd 3 so prompts keep the terminal on stdin.
+  while IFS=$'\t' read -r st rel <&3; do
     case "$st" in
       invalid)
         err "refusing to restore '$rel' from the vault: not an env file name or not a safe path"
@@ -313,7 +314,7 @@ cmd_restore() {
         if [[ "${ARG_FORCE:-0}" == 1 || "${ASSUME_YES:-0}" == 1 ]] || ! is_interactive; then
           overwrite=1
         else
-          say "$rel differs from the vault: $(key_diff_line "$rel")" </dev/null
+          say "$rel differs from the vault: $(key_diff_line "$rel")"
           if confirm "Overwrite $rel with the vault version? (the current file is backed up)"; then
             overwrite=1
           fi
@@ -332,7 +333,7 @@ cmd_restore() {
         fi
         ;;
     esac
-  done <"$plan"
+  done 3<"$plan"
 
   if [[ $backed -gt 0 ]]; then
     say "${C_DIM}previous versions backed up (encrypted) in $(tildify "$BACKUP_DIR")${C_RST}"
@@ -467,7 +468,7 @@ cmd_forget() {
     err "not in the vault: ${file:+$file of }$name"
     return 1
   fi
-  if ! confirm "Remove $what from the vault? (old versions stay in git history)"; then
+  if ! confirm "Remove $what from the vault? (old versions stay in git history)" no; then
     if is_interactive; then say "cancelled"; return 0; fi
     err "refusing to remove without confirmation: add --yes"
     return 1
