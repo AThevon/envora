@@ -145,6 +145,12 @@ case "$1 ${2:-}" in
     ;;
   "env add"|"env update")
     value="$(cat)"
+    # vercel 58: without --non-interactive, "env add NAME preview" asks
+    # "Git branch?", reads the empty stdin and exits 0 having added nothing.
+    case " $* " in
+      *" --non-interactive "*) ;;
+      *) [[ "$4" == preview ]] && exit 0 ;;
+    esac
     echo "$2 $4 $3=$value" >>"$STUB/vercel.stdin"
     ;;
   *) echo "stub vercel: unhandled $*" >&2; exit 1 ;;
@@ -1128,10 +1134,10 @@ t_export_cloudflare_stub() {
   expect_rc 0 save
   # dry run: plan only
   expect_rc 0 export cloudflare --dry-run
-  assert_contains "$OUT" "+ add     MULTI NEW_ONE"
-  assert_contains "$OUT" "~ update  API_TOKEN"
-  assert_contains "$OUT" "only on Cloudflare, kept: REMOTE_ONLY"
-  assert_contains "$OUT" "Worker edge-worker"
+  assert_contains "$OUT" "+ add      MULTI NEW_ONE"
+  assert_contains "$OUT" "~ update   API_TOKEN"
+  assert_contains "$OUT" "kept     REMOTE_ONLY  (only on Cloudflare"
+  assert_contains "$OUT" "Worker edge-worker (deployed, top-level)"
   assert_no_file "$STUB/wrangler.stdin"
   # no confirmation, no terminal: refused
   expect_rc 1 export cloudflare
@@ -1141,16 +1147,24 @@ t_export_cloudflare_stub() {
   assert_eq "$(jq -r '.API_TOKEN' "$STUB/wrangler.stdin")" "tok en"
   assert_eq "$(jq -r '.MULTI' "$STUB/wrangler.stdin")" "$(printf 'line1\nline2')"
   assert_eq "$(jq -r 'keys | join(",")' "$STUB/wrangler.stdin")" "API_TOKEN,MULTI,NEW_ONE"
-  assert_contains "$(cat "$STUB/wrangler.log")" "secret bulk (cwd=$p/apps/edge)"
+  assert_contains "$(cat "$STUB/wrangler.log")" "secret list --format json --config $p/apps/edge/wrangler.toml (cwd=$p/apps/edge)"
+  assert_contains "$(cat "$STUB/wrangler.log")" "secret bulk --config $p/apps/edge/wrangler.toml (cwd=$p/apps/edge)"
   assert_not_contains "$(cat "$STUB/wrangler.log")" "tok en"
   # --env picks .dev.vars.<env> and passes --env
   expect_rc 0 export cloudflare --env staging --yes
   assert_eq "$(jq -c . "$STUB/wrangler.stdin")" '{"STAGE_ONLY":"1"}'
-  assert_contains "$(tail -n 1 "$STUB/wrangler.log")" "secret bulk --env staging"
+  assert_contains "$(tail -n 1 "$STUB/wrangler.log")" "secret bulk --config $p/apps/edge/wrangler.toml --env staging"
   # local file differs from the vault: warned
   printf 'API_TOKEN=newer\n' >"$p/apps/edge/.dev.vars"
   expect_rc 0 export cloudflare --dry-run
   assert_contains "$OUT" "differs from the vault copy"
+  # a dotenv key that looks like an option never reaches the wrangler argv
+  # or the payload; KEY: value lines are read like dotenv does
+  printf -- '--scope=evil\nGOOD=1\nCOLON: yes\n' >"$p/apps/edge/.dev.vars"
+  expect_rc 0 save
+  expect_rc 0 export cloudflare --yes
+  assert_contains "$OUT" "! skipped  --scope"
+  assert_eq "$(jq -cS . "$STUB/wrangler.stdin")" '{"COLON":"yes","GOOD":"1"}'
 }
 
 t_export_cloudflare_pages() {
@@ -1163,8 +1177,9 @@ t_export_cloudflare_pages() {
   expect_rc 1 export cloudflare --env staging --yes
   assert_contains "$OUT" "only has the production and preview"
   expect_rc 0 export cloudflare --yes
-  assert_contains "$OUT" "only on Cloudflare, kept: OLD_SECRET"
-  assert_contains "$(tail -n 1 "$STUB/wrangler.log")" "pages secret bulk (cwd=$p)"
+  assert_contains "$OUT" "kept     OLD_SECRET"
+  assert_contains "$OUT" "Pages project site (production)"
+  assert_contains "$(tail -n 1 "$STUB/wrangler.log")" "pages secret bulk --project-name site (cwd=$p)"
   assert_eq "$(jq -c . "$STUB/wrangler.stdin")" '{"S":"1"}'
   # the name wrangler will use: comments, nested names and trailing commas ignored
   printf '{\n  "$schema": "https://x/schema.json", // "name": "old-site",\n  /* "name": "older" */\n  "name": "real-site",\n  "vars": {"name": "nope",},\n  "pages_build_output_dir": "./dist",\n}\n' >"$p/wrangler.jsonc"
@@ -1203,6 +1218,9 @@ t_export_cloudflare_safety() {
   assert_no_file "$STUB/wrangler.stdin"
   expect_rc 0 export cloudflare --env production --file .dev.vars --yes
   assert_eq "$(jq -c . "$STUB/wrangler.stdin")" '{"API_TOKEN":"tok"}'
+  # quotes in a command setting are refused, not passed literally
+  ENVORA_WRANGLER_CMD="wrangler --profile 'my prof'" expect_rc 1 export cloudflare --dry-run
+  assert_contains "$OUT" "quotes and backslashes are not supported"
   # monorepo: the config of the current folder is picked
   local m
   m="$(mkproject mono)"
@@ -1217,6 +1235,17 @@ t_export_cloudflare_safety() {
   cd "$m/apps/edge/src"
   expect_rc 0 export cloudflare --dry-run
   assert_contains "$OUT" "Worker edge"
+  # a wrangler.json at the root (wrangler would find it from apps/edge): the
+  # config of the folder is passed explicitly, the root one is never used
+  printf '{"name":"root-worker"}\n' >"$m/wrangler.json"
+  expect_rc 0 export cloudflare --yes
+  assert_contains "$(tail -n 1 "$STUB/wrangler.log")" "secret bulk --config $m/apps/edge/wrangler.toml (cwd=$m/apps/edge)"
+  # -C <subdir> (what the menu passes) picks the same config
+  cd "$T"
+  expect_rc 0 export cloudflare -C "$m/apps/edge/src" --dry-run
+  assert_contains "$OUT" "Worker edge"
+  # without --env, the plan says the target is the deployed Worker
+  assert_contains "$OUT" "the deployed Worker (no --env)"
 }
 
 t_export_vercel_stub() {
@@ -1237,10 +1266,10 @@ EOF
   cd "$p"
   expect_rc 0 save
   expect_rc 0 export vercel --dry-run
-  assert_contains "$OUT" "+ add     FRESH"
-  assert_contains "$OUT" "~ update  EXISTING"
+  assert_contains "$OUT" "+ add      FRESH"
+  assert_contains "$OUT" "~ update   EXISTING"
   assert_contains "$OUT" "= same     SAME"
-  assert_contains "$OUT" "only on Vercel, kept: ONLY_REMOTE"
+  assert_contains "$OUT" "kept     ONLY_REMOTE  (only on Vercel"
   assert_no_file "$STUB/vercel.stdin"
   expect_rc 0 export vercel --yes
   assert_contains "$OUT" "FRESH  added"
@@ -1249,7 +1278,17 @@ EOF
   assert_contains "$(cat "$STUB/vercel.stdin")" "update production EXISTING=new-value"
   assert_not_contains "$(cat "$STUB/vercel.stdin")" "SAME"
   assert_not_contains "$(cat "$STUB/vercel.log")" "new-value"
-  assert_contains "$(cat "$STUB/vercel.log")" "env add FRESH production --yes"
+  assert_contains "$(cat "$STUB/vercel.log")" "env add FRESH production --yes --non-interactive"
+  assert_contains "$(cat "$STUB/vercel.log")" "env ls production --format json --non-interactive"
+  # preview: a new key is really added (vercel would prompt for a branch)
+  printf 'NEWK=secret-value\nURL=$BASE/api\n--scope=evil-team\n' >"$p/.env.preview"
+  printf '{"envs":[]}\n' >"$STUB/vercel.ls.preview.json"
+  expect_rc 0 save
+  expect_rc 0 export vercel --env preview --yes
+  assert_contains "$(cat "$STUB/vercel.stdin")" "add preview NEWK=secret-value"
+  assert_contains "$OUT" "! skipped  --scope"
+  assert_contains "$OUT" "URL  (the value contains \$NAME"
+  assert_not_contains "$(cat "$STUB/vercel.log")" "--scope"
   # explicit file needs an env when it cannot be guessed
   printf 'X=1\n' >"$p/.env.custom"
   expect_rc 0 save
@@ -1274,7 +1313,7 @@ EOF
   cd "$p"
   expect_rc 0 save
   expect_rc 0 export vercel --env development --yes
-  assert_contains "$OUT" "! shared  DATABASE_URL (also production, preview)"
+  assert_contains "$OUT" "! shared   DATABASE_URL (also production, preview)"
   assert_contains "$OUT" "--update-shared"
   assert_contains "$OUT" "PREV_BRANCHY  (also has branch-specific values"
   assert_contains "$OUT" "EMPTY  (empty value"
@@ -1284,6 +1323,19 @@ EOF
   assert_not_contains "$(cat "$STUB/vercel.stdin")" "PREV_BRANCHY"
   expect_rc 0 export vercel --env development --update-shared --yes
   assert_contains "$(cat "$STUB/vercel.stdin")" "update development DATABASE_URL=postgres://localhost/dev"
+  # a variable that also serves a custom environment (env ls has no
+  # customEnvironmentIds): found by listing that environment, so it is shared
+  printf '{"targets":[{"slug":"production"},{"slug":"staging"}]}\n' >"$STUB/vercel.targets.json"
+  cat >"$STUB/vercel.ls.development.json" <<'EOF'
+{"envs":[{"key":"OWN","type":"encrypted","target":["development"],"createdAt":111}]}
+EOF
+  cat >"$STUB/vercel.ls.staging.json" <<'EOF'
+{"envs":[{"key":"OWN","type":"encrypted","target":[],"createdAt":111}]}
+EOF
+  rm -f "$STUB/vercel.stdin"
+  expect_rc 0 export vercel --env development --yes
+  assert_contains "$OUT" "! shared   OWN (also staging)"
+  assert_not_contains "$(cat "$STUB/vercel.stdin")" "OWN"
   # repo link (vercel link --repo) counts as linked
   local m
   m="$(mkproject mono)"

@@ -13,6 +13,11 @@
 #     - update changes the whole variable: every environment it targets
 #   .vercel/project.json (vercel link) or .vercel/repo.json at the repo root
 #     (vercel link --repo: {"projects":[{"name","directory"}]})
+#   --non-interactive on every call: a piped stdin is not enough for the CLI
+#     to skip its prompts (env add NAME preview asks "Git branch?", reads the
+#     empty stdin and exits 0 without adding anything)
+#   env ls --format json has no customEnvironmentIds: a variable that also
+#     serves a custom environment is found by listing that environment too
 
 VERCEL_STD_ENVS="development preview production"
 VERCEL_STDIN_MAX=60000
@@ -112,7 +117,7 @@ vercel_import() {
   if [[ -z "$envs" ]]; then
     envs="$VERCEL_STD_ENVS"
     local custom
-    custom="$( (cd "$pdir" && "${PCMD[@]}" target list --format json) 2>/dev/null | jq -r '.targets[]?.slug // empty' 2>/dev/null || true)"
+    custom="$( (cd "$pdir" && "${PCMD[@]}" target list --format json --non-interactive) 2>/dev/null | jq -r '.targets[]?.slug // empty' 2>/dev/null || true)"
     local s
     for s in $custom; do
       case " $envs " in *" $s "*) ;; *) envs="$envs $s" ;; esac
@@ -125,7 +130,7 @@ vercel_import() {
     tmp="$TMP_ROOT/vercel.$env.env"
     merged="$TMP_ROOT/vercel.$env.merged"
     rm -f "$tmp" "$merged"
-    if ! (cd "$pdir" && "${PCMD[@]}" env pull "$tmp" --environment "$env" --yes) >"$TMP_ROOT/vercel.out" 2>&1 || [[ ! -f "$tmp" ]]; then
+    if ! (cd "$pdir" && "${PCMD[@]}" env pull "$tmp" --environment "$env" --yes --non-interactive) >"$TMP_ROOT/vercel.out" 2>&1 || [[ ! -f "$tmp" ]]; then
       err "vercel env pull failed for $env:"
       show_tool_output "$TMP_ROOT/vercel.out"
       failed=$((failed + 1))
@@ -205,6 +210,7 @@ VERCEL_KEYS_JQ='
   [ .envs[]?
     | { key,
         branch: ((.gitBranch // "") != ""),
+        c: (.createdAt // ""),
         t: ((.target // []) | if type == "array" then . else [.] end) }
     | select(($std | index($e) | not) or (.t | index($e) != null)) ]
   | group_by(.key)[]
@@ -213,7 +219,8 @@ VERCEL_KEYS_JQ='
   | [ $g[0].key,
       (if $main then ($main.t - [$e] | join(", ")) else "" end),
       (if ([$g[] | select(.branch)] | length) > 0 then "branch" else "" end),
-      (if $main then "general" else "" end) ]
+      (if $main then "general" else "" end),
+      (if $main then ($main.c | tostring) else "" end) ]
   | @tsv'
 
 vercel_export() {
@@ -269,7 +276,8 @@ vercel_export() {
 
   local recs keys
   recs="$(decrypt_stream "$base/$file.age" | dotenv_json v)" || { err "cannot decrypt $file"; return 1; }
-  keys="$(printf '%s\n' "$recs" | jq -r '.k' | LC_ALL=C sort -u)"
+  split_var_names "$(printf '%s\n' "$recs" | jq -r '.k' | LC_ALL=C sort -u)"
+  keys="$VALID_KEYS"
   if [[ -z "$keys" ]]; then
     warn "$file has no variables: nothing to send"
     return 0
@@ -277,7 +285,7 @@ vercel_export() {
 
   provider_cmd vercel || return 1
   step "reading the variables of Vercel ($env)"
-  if ! (cd "$pdir" && "${PCMD[@]}" env ls "$env" --format json) >"$TMP_ROOT/vls.json" 2>"$TMP_ROOT/vls.err"; then
+  if ! (cd "$pdir" && "${PCMD[@]}" env ls "$env" --format json --non-interactive) >"$TMP_ROOT/vls.json" 2>"$TMP_ROOT/vls.err"; then
     err "vercel env ls failed:"
     show_tool_output "$TMP_ROOT/vls.err"
     return 1
@@ -287,6 +295,17 @@ vercel_export() {
     err "unexpected output from vercel env ls"
     return 1
   }
+  # Custom environments: "env ls" does not say which variables also serve
+  # them, so each one is listed; the same variable shows up with the same
+  # creation time. Lines: "key<TAB>createdAt<TAB>slug".
+  local custom slug
+  : >"$TMP_ROOT/vcustom.tsv"
+  custom="$( (cd "$pdir" && "${PCMD[@]}" target list --format json --non-interactive) 2>/dev/null | jq -r '.targets[]?.slug // empty' 2>/dev/null || true)"
+  for slug in $custom; do
+    case " $VERCEL_STD_ENVS $env " in *" $slug "*) continue ;; esac
+    (cd "$pdir" && "${PCMD[@]}" env ls "$slug" --format json --non-interactive) 2>/dev/null |
+      jq -r --arg s "$slug" '.envs[]? | select((.gitBranch // "") == "") | [.key, (.createdAt // "" | tostring), $s] | @tsv' 2>/dev/null >>"$TMP_ROOT/vcustom.tsv" || true
+  done
   local remote_filter='
     .envs[]? | select((.gitBranch // "") == "")
     | select(
@@ -302,16 +321,27 @@ vercel_export() {
              | (map(select(.s=="v")) | map({(.k): .v}) | add // {}) as $V
              | $V | keys[] as $k | select(($R | has($k)) and $R[$k] == $V[$k]) | $k' 2>/dev/null || true)"
 
-  local k line others branch general val len
-  local add=() upd=() same=() only=() shared=() shared_info=() branchy=() empty=() big=()
+  local k line others branch general created cust val len
+  local add=() upd=() same=() only=() shared=() shared_info=() branchy=() empty=() big=() expands=()
   while IFS= read -r k; do
     [[ -z "$k" ]] && continue
     line="$(printf '%s\n' "$info" | awk -F '\t' -v k="$k" '$1 == k' | head -n 1)"
     others="$(printf '%s' "$line" | cut -f2)"
     branch="$(printf '%s' "$line" | cut -f3)"
     general="$(printf '%s' "$line" | cut -f4)"
+    created="$(printf '%s' "$line" | cut -f5)"
+    if [[ "$general" == general && -s "$TMP_ROOT/vcustom.tsv" ]]; then
+      cust="$(awk -F '\t' -v k="$k" -v c="$created" '$1 == k && $2 == c { print $3 }' "$TMP_ROOT/vcustom.tsv" | LC_ALL=C sort -u | tr '\n' ' ')"
+      cust="${cust% }"
+      if [[ -n "$cust" ]]; then
+        others="${others:+$others, }${cust// /, }"
+      fi
+    fi
     val="$(printf '%s\n' "$recs" | jq -sj --arg k "$k" 'map(select(.k == $k)) | last | .v')"
     len=${#val}
+    case "$val" in
+      *'$'[A-Za-z_]*|*'${'*) expands[${#expands[@]}]="$k" ;;
+    esac
     if printf '%s\n' "$plain_same" | grep -Fxq -- "$k"; then
       same[${#same[@]}]="$k"
     elif [[ $len -eq 0 ]]; then
@@ -339,17 +369,19 @@ vercel_export() {
   done <<<"$info"
 
   plan_line "${C_BOLD}vault → Vercel${C_RST}  ${C_DIM}vault/$PROJECT_NAME/$file → Vercel $env ($(dir_label "$reldir"))${C_RST}"
-  [[ ${#add[@]} -gt 0 ]] && plan_line "  ${C_ACC}+ add${C_RST}     $(join_by ' ' "${add[@]}")"
-  [[ ${#upd[@]} -gt 0 ]] && plan_line "  ${C_WARN}~ update${C_RST}  $(join_by ' ' "${upd[@]}")"
+  [[ ${#add[@]} -gt 0 ]] && plan_line "  ${C_ACC}+ add${C_RST}      $(join_by ' ' "${add[@]}")"
+  [[ ${#upd[@]} -gt 0 ]] && plan_line "  ${C_WARN}~ update${C_RST}   $(join_by ' ' "${upd[@]}")"
   [[ ${#same[@]} -gt 0 ]] && plan_line "  ${C_DIM}= same     $(join_by ' ' "${same[@]}")${C_RST}"
   if [[ ${#shared[@]} -gt 0 ]]; then
-    plan_line "  ${C_WARN}! shared${C_RST}  $(join_by ', ' "${shared_info[@]}")"
-    plan_line "            ${C_DIM}one variable on Vercel serves several environments: updating it changes them all${C_RST}"
+    plan_line "  ${C_WARN}! shared${C_RST}   $(join_by ', ' "${shared_info[@]}")"
+    plan_line "             ${C_DIM}one variable on Vercel serves several environments: updating it changes them all${C_RST}"
   fi
-  [[ ${#branchy[@]} -gt 0 ]] && plan_line "  ${C_WARN}! skipped${C_RST} $(join_by ' ' "${branchy[@]}")  ${C_DIM}(also has branch-specific values: change it in the Vercel dashboard)${C_RST}"
+  [[ ${#branchy[@]} -gt 0 ]] && plan_line "  ${C_WARN}! skipped${C_RST}  $(join_by ' ' "${branchy[@]}")  ${C_DIM}(also has branch-specific values: change it in the Vercel dashboard)${C_RST}"
+  [[ ${#BAD_KEYS[@]} -gt 0 ]] && plan_line "  ${C_WARN}! skipped${C_RST}  $(join_by ' ' "${BAD_KEYS[@]}")  ${C_DIM}(not a valid variable name)${C_RST}"
   [[ ${#empty[@]} -gt 0 ]] && plan_line "  ${C_DIM}· skipped  $(join_by ' ' "${empty[@]}")  (empty value: the Vercel CLI cannot receive it, set it by hand)${C_RST}"
   [[ ${#big[@]} -gt 0 ]] && plan_line "  ${C_DIM}· skipped  $(join_by ' ' "${big[@]}")  (value over 60 KB: the Vercel CLI would cut it, set it by hand)${C_RST}"
-  [[ ${#only[@]} -gt 0 ]] && plan_line "  ${C_DIM}· only on Vercel, kept: $(join_by ' ' "${only[@]}")${C_RST}"
+  [[ ${#only[@]} -gt 0 ]] && plan_line "  ${C_DIM}· kept     $(join_by ' ' "${only[@]}")  (only on Vercel, never deleted)${C_RST}"
+  [[ ${#expands[@]} -gt 0 ]] && plan_line "  ${C_WARN}! note${C_RST}     $(join_by ' ' "${expands[@]}")  ${C_DIM}(the value contains \$NAME: sent as written, Vercel does not expand it; Next.js does locally)${C_RST}"
 
   # Shared variables are only updated on an explicit yes.
   local send_shared=0
@@ -361,7 +393,7 @@ vercel_export() {
         send_shared=1
       fi
     else
-      plan_line "            ${C_DIM}skipped: add --update-shared to update them anyway${C_RST}"
+      plan_line "             ${C_DIM}skipped: add --update-shared to update them anyway${C_RST}"
     fi
   fi
   [[ $send_shared == 1 ]] && upd=(${upd[@]+"${upd[@]}"} "${shared[@]}")
@@ -390,7 +422,7 @@ vercel_export() {
     action=add label=added
     if printf '%s\n' "${upd[@]+"${upd[@]}"}" | grep -Fxq -- "$k"; then action=update label=updated; fi
     if printf '%s\n' "$recs" | jq -sj --arg k "$k" 'map(select(.k == $k)) | last | .v' |
-      (cd "$pdir" && "${PCMD[@]}" env "$action" "$k" "$env" --yes) >"$TMP_ROOT/vadd.out" 2>&1; then
+      (cd "$pdir" && "${PCMD[@]}" env "$action" "$k" "$env" --yes --non-interactive) >"$TMP_ROOT/vadd.out" 2>&1; then
       done_n=$((done_n + 1))
       step "$k  ${C_DIM}$label${C_RST}"
     else

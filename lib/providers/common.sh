@@ -24,6 +24,15 @@ provider_cmd() {
   esac
   PCMD=()
   if [[ -n "$override" ]]; then
+    # A plain list of words (split on spaces, no shell parsing): quotes would
+    # be passed literally, so they are refused; use a wrapper script instead.
+    case "$override" in
+      *\"*|*\'*|*\\*)
+        err "ENVORA_$(printf '%s' "$tool" | tr '[:lower:]' '[:upper:]')_CMD: quotes and backslashes are not supported (words are split on spaces)"
+        say "  put the command in a small script and point the setting at it"
+        return 1
+        ;;
+    esac
     local w
     set -f
     for w in $override; do PCMD[${#PCMD[@]}]="$w"; done
@@ -79,31 +88,28 @@ in_dir() {
 }
 
 # pick_dir "label" "dirs (one per line)" -> chosen absolute dir
-# Uses -C <dir> when it is one of them, else the deepest one holding the
-# current directory, else the only one, else asks.
+# The deepest one holding -C <dir> (or the current directory), so running
+# envora inside apps/web of a monorepo targets apps/web; the project root is
+# only picked that way when -C names it or it is the only one. Else the only
+# one, else asks (or fails without a terminal).
 pick_dir() {
-  local label="$1" list="$2" cand c_abs="" count here best=""
+  local label="$1" list="$2" cand count here best=""
   [[ -n "$list" ]] || return 1
   count="$(printf '%s\n' "$list" | grep -c .)"
   if [[ -n "${ARG_C:-}" ]]; then
-    c_abs="$(abs_dir "$ARG_C" || true)"
-    while IFS= read -r cand; do
-      if [[ "$cand" == "$c_abs" ]]; then
-        printf '%s' "$cand"
-        return 0
-      fi
-    done <<<"$list"
+    here="$(abs_dir "$ARG_C" || true)"
   else
     here="$(pwd -P 2>/dev/null || true)"
-    while IFS= read -r cand; do
-      case "$here/" in
-        "$cand"/*) [[ ${#cand} -gt ${#best} ]] && best="$cand" ;;
-      esac
-    done <<<"$list"
-    if [[ -n "$best" && ( "$best" != "$PROJECT_DIR" || "$count" -eq 1 ) ]]; then
-      printf '%s' "$best"
-      return 0
-    fi
+  fi
+  while IFS= read -r cand; do
+    case "$here/" in
+      "$cand"/*) [[ ${#cand} -gt ${#best} ]] && best="$cand" ;;
+    esac
+  done <<<"$list"
+  if [[ -n "$best" ]] && { [[ "$best" != "$PROJECT_DIR" || "$count" -eq 1 ]] ||
+    [[ -n "${ARG_C:-}" && "$here" == "$best" ]]; }; then
+    printf '%s' "$best"
+    return 0
   fi
   if [[ "$count" -eq 1 ]]; then
     printf '%s' "$list"

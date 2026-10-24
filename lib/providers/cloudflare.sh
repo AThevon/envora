@@ -7,13 +7,16 @@
 #   wrangler secret bulk [--env e]                 JSON {"k":"v"} on stdin, 100 max, deploys
 #   wrangler pages secret list [--env production|preview]
 #       text: '  - NAME: Value Encrypted'
-#   wrangler pages secret bulk [--env production|preview]
-#   Pages commands read the project name from the wrangler config in the
-#   current directory (config.name), so envora runs them there and does not
-#   pass --project-name.
+#   wrangler pages secret bulk [--env production|preview] --project-name P
+#   wrangler looks for its config in the current folder AND its parents
+#   (wrangler.json, then wrangler.jsonc, then wrangler.toml): in a monorepo a
+#   wrangler.json at the root would win over apps/api/wrangler.toml. So envora
+#   always names the config (--config) for Workers and the project
+#   (--project-name, Pages ignores --config), and runs in that folder.
+#   Without --env: the top-level (deployed) Worker, or Pages production.
 # Cloudflare secrets are write-only: values cannot be read back or imported.
 
-CF_CONFIGS="wrangler.jsonc wrangler.json wrangler.toml"
+CF_CONFIGS="wrangler.json wrangler.jsonc wrangler.toml"
 CF_BATCH=100
 
 cloudflare_dirs() {
@@ -125,9 +128,10 @@ cf_kind() {
   if [[ "$CF_PAGES" == 1 ]]; then printf 'Pages project'; else printf 'Worker'; fi
 }
 
-# Source file in the vault for an environment (first existing). With an
-# environment, only the files for it: the unsuffixed .dev.vars holds local
-# development values and is never sent to a remote environment by default.
+# Source file in the vault for an environment (first existing):
+#   no --env    .dev.vars, else .env      -> the deployed top-level Worker
+#   --env e     .dev.vars.e, else .env.e  -> environment e
+# (--file picks any other saved file.)
 cf_source_file() {
   local reldir="$1" env="$2" c cands
   if [[ -n "$env" ]]; then
@@ -182,13 +186,14 @@ cloudflare_export() {
       if [[ -n "$P_ENV" ]]; then
         err "no $(in_dir "$reldir" ".dev.vars.$P_ENV") or $(in_dir "$reldir" ".env.$P_ENV") saved in the vault"
         if cf_source_file "$reldir" "" >/dev/null; then
-          say "  $(cf_source_file "$reldir" "") holds your local development values; to send it to $P_ENV anyway:"
-          say "  ev export cloudflare --env $P_ENV --file $(cf_source_file "$reldir" "")"
+          say "  to send $(cf_source_file "$reldir" "") to $P_ENV instead: ev export cloudflare --env $P_ENV --file $(cf_source_file "$reldir" "")"
+        else
+          say "  save your local file first (ev save), or choose one with --file"
         fi
       else
         err "no $(in_dir "$reldir" .dev.vars) or $(in_dir "$reldir" .env) saved in the vault for $PROJECT_NAME"
+        say "  save your local file first (ev save), or choose one with --file"
       fi
-      say "  save your local file first (ev save), or choose one with --file"
       return 1
     fi
   elif [[ ! -f "$ENVORA_VAULT/$PROJECT_NAME/$file.age" ]]; then
@@ -199,33 +204,43 @@ cloudflare_export() {
 
   local recs keys count
   recs="$(decrypt_stream "$ENVORA_VAULT/$PROJECT_NAME/$file.age" | dotenv_json v)" || { err "cannot decrypt $file"; return 1; }
-  keys="$(printf '%s\n' "$recs" | jq -r '.k' | LC_ALL=C sort -u)"
+  split_var_names "$(printf '%s\n' "$recs" | jq -r '.k' | LC_ALL=C sort -u)"
+  keys="$VALID_KEYS"
   count="$(printf '%s\n' "$keys" | grep -c . || true)"
+  if [[ ${#BAD_KEYS[@]} -gt 0 ]]; then
+    recs="$(printf '%s\n' "$recs" | jq -c 'select(.k | test("^[A-Za-z_][A-Za-z0-9_]*$"))')"
+  fi
   if [[ "$count" -eq 0 ]]; then
     warn "$file has no variables: nothing to send"
     return 0
   fi
 
   provider_cmd wrangler || return 1
-  local env_args=() target_label
+  local env_args=() target_args=() target_label
   [[ -n "$P_ENV" ]] && env_args=(--env "$P_ENV")
   if [[ $pages == 1 ]]; then
+    target_args=(--project-name "$name")
     target_label="Pages project $name (${P_ENV:-production})"
   else
-    target_label="Worker ${name:-(from $(basename "$cfg"))}${P_ENV:+ (env $P_ENV)}"
+    target_args=(--config "$cfg")
+    if [[ -n "$P_ENV" ]]; then
+      target_label="Worker ${name:-(from $(basename "$cfg"))}, environment $P_ENV"
+    else
+      target_label="Worker ${name:-(from $(basename "$cfg"))} (deployed, top-level)"
+    fi
   fi
 
   step "reading the secret names of the $target_label"
   local remote=""
   if [[ $pages == 1 ]]; then
-    if ! (cd "$cfdir" && "${PCMD[@]}" pages secret list ${env_args[@]+"${env_args[@]}"}) >"$TMP_ROOT/cfl.out" 2>"$TMP_ROOT/cfl.err"; then
+    if ! (cd "$cfdir" && "${PCMD[@]}" pages secret list "${target_args[@]}" ${env_args[@]+"${env_args[@]}"}) >"$TMP_ROOT/cfl.out" 2>"$TMP_ROOT/cfl.err"; then
       err "wrangler pages secret list failed:"
       show_tool_output "$TMP_ROOT/cfl.err"
       return 1
     fi
     remote="$(sed -n 's/^[[:space:]]*- \([^:]*\):.*/\1/p' "$TMP_ROOT/cfl.out" | LC_ALL=C sort -u)"
   else
-    if ! (cd "$cfdir" && "${PCMD[@]}" secret list --format json ${env_args[@]+"${env_args[@]}"}) >"$TMP_ROOT/cfl.out" 2>"$TMP_ROOT/cfl.err"; then
+    if ! (cd "$cfdir" && "${PCMD[@]}" secret list --format json "${target_args[@]}" ${env_args[@]+"${env_args[@]}"}) >"$TMP_ROOT/cfl.out" 2>"$TMP_ROOT/cfl.err"; then
       err "wrangler secret list failed:"
       show_tool_output "$TMP_ROOT/cfl.err"
       return 1
@@ -247,9 +262,13 @@ cloudflare_export() {
   done <<<"$remote"
 
   plan_line "${C_BOLD}vault → Cloudflare${C_RST}  ${C_DIM}vault/$PROJECT_NAME/$file → $target_label$([[ "$reldir" != "." ]] && printf ' (%s)' "$reldir")${C_RST}"
-  [[ ${#add[@]} -gt 0 ]] && plan_line "  ${C_ACC}+ add${C_RST}     $(join_by ' ' "${add[@]}")"
-  [[ ${#upd[@]} -gt 0 ]] && plan_line "  ${C_WARN}~ update${C_RST}  $(join_by ' ' "${upd[@]}")  ${C_DIM}(values are write-only, so every key is sent)${C_RST}"
-  [[ ${#only[@]} -gt 0 ]] && plan_line "  ${C_DIM}· only on Cloudflare, kept: $(join_by ' ' "${only[@]}")${C_RST}"
+  [[ ${#add[@]} -gt 0 ]] && plan_line "  ${C_ACC}+ add${C_RST}      $(join_by ' ' "${add[@]}")"
+  [[ ${#upd[@]} -gt 0 ]] && plan_line "  ${C_WARN}~ update${C_RST}   $(join_by ' ' "${upd[@]}")  ${C_DIM}(values are write-only, so every key is sent)${C_RST}"
+  [[ ${#only[@]} -gt 0 ]] && plan_line "  ${C_DIM}· kept     $(join_by ' ' "${only[@]}")  (only on Cloudflare, never deleted)${C_RST}"
+  [[ ${#BAD_KEYS[@]} -gt 0 ]] && plan_line "  ${C_WARN}! skipped${C_RST}  $(join_by ' ' "${BAD_KEYS[@]}")  ${C_DIM}(not a valid variable name)${C_RST}"
+  if [[ $pages == 0 && -z "$P_ENV" ]]; then
+    plan_line "  ${C_DIM}target: the deployed Worker (no --env). Another environment: --env <name>, which sends .dev.vars.<name>${C_RST}"
+  fi
 
   if [[ $P_DRY == 1 ]]; then
     plan_line "${C_DIM}dry run: nothing sent${C_RST}"
@@ -266,10 +285,10 @@ cloudflare_export() {
   while [[ $i -lt $count ]]; do
     if [[ $pages == 1 ]]; then
       printf '%s' "$json" | jq -c --argjson i "$i" --argjson n "$CF_BATCH" 'to_entries | .[$i:$i+$n] | from_entries' |
-        (cd "$cfdir" && "${PCMD[@]}" pages secret bulk ${env_args[@]+"${env_args[@]}"}) >"$TMP_ROOT/cfb.out" 2>&1 || batch_rc=$?
+        (cd "$cfdir" && "${PCMD[@]}" pages secret bulk "${target_args[@]}" ${env_args[@]+"${env_args[@]}"}) >"$TMP_ROOT/cfb.out" 2>&1 || batch_rc=$?
     else
       printf '%s' "$json" | jq -c --argjson i "$i" --argjson n "$CF_BATCH" 'to_entries | .[$i:$i+$n] | from_entries' |
-        (cd "$cfdir" && "${PCMD[@]}" secret bulk ${env_args[@]+"${env_args[@]}"}) >"$TMP_ROOT/cfb.out" 2>&1 || batch_rc=$?
+        (cd "$cfdir" && "${PCMD[@]}" secret bulk "${target_args[@]}" ${env_args[@]+"${env_args[@]}"}) >"$TMP_ROOT/cfb.out" 2>&1 || batch_rc=$?
     fi
     if [[ $batch_rc -ne 0 ]]; then
       err "wrangler secret bulk failed:"

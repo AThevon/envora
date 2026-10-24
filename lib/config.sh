@@ -229,8 +229,8 @@ config_describe() {
     ENVORA_KEY) echo "Key: your age private key (keep a copy in a password manager)" ;;
     ENVORA_PROJECTS) echo "Projects: where 'ev restore NAME' looks for NAME" ;;
     ENVORA_REPO) echo "GitHub repo of the vault (user/name)" ;;
-    ENVORA_VERCEL_CMD) echo "Command used for Vercel (default: vercel, else npx)" ;;
-    ENVORA_WRANGLER_CMD) echo "Command used for Cloudflare (default: wrangler, else npx)" ;;
+    ENVORA_VERCEL_CMD) echo "Command used for Vercel (default: vercel, else npx); words split on spaces, no quotes" ;;
+    ENVORA_WRANGLER_CMD) echo "Command used for Cloudflare (default: wrangler, else npx); words split on spaces, no quotes" ;;
   esac
 }
 
