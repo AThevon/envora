@@ -74,12 +74,20 @@ menu_fzf() {
     down="transform:[ {n} -eq $((sep - 2)) ] && echo down+down || echo down"
     up="transform:[ {n} -eq $sep ] && echo up+up || echo up"
   fi
+  # word wrapping in the preview when this fzf knows it (probed once)
+  if [[ -z "${MENU_WRAP:-}" ]]; then
+    if printf 'x\n' | fzf --filter x --preview-window=wrap-word >/dev/null 2>&1; then
+      MENU_WRAP=wrap-word
+    else
+      MENU_WRAP=wrap
+    fi
+  fi
   choice="$(ENVORA_COLOR=1 fzf --ansi --no-sort --no-input --layout=reverse \
     --height=85% --min-height=24 --border=rounded --border-label=" $label " \
     --delimiter=$'\t' --with-nth=2 --header="$header" --header-first \
     --pointer='›' --color="$FZF_COLORS" \
     --preview='"$ENVORA_BASH" "$ENVORA_SELF" _preview {1}' \
-    --preview-window='right,40%,wrap,border-left,<44(down,40%,wrap,border-top)' \
+    --preview-window="right,45%,$MENU_WRAP,border-left,<44(down,40%,$MENU_WRAP,border-top)" \
     --bind="load:pos($pos)" \
     --bind='?:preview("$ENVORA_BASH" "$ENVORA_SELF" _preview keys)' \
     --bind="down:$down" --bind="j:$down" --bind="up:$up" --bind="k:$up" \
@@ -128,7 +136,7 @@ menu_header_project() {
     state="$(join_by ' · ' "${parts[@]}")"
   fi
   [[ $unreached -gt 0 ]] && state="$state · ${C_ERR}$(plural "$unreached" "env file") NOT reached (see Save)${C_RST}"
-  printf '%s%s%s  %s\n%s%s%s' "$C_BOLD" "$PROJECT_NAME" "$C_RST" "$state" "$C_DIM" "vault: $(vault_sync_label) · ? keys" "$C_RST"
+  printf '%s%s%s  %s\n%s%s%s' "$C_BOLD" "$PROJECT_NAME" "$C_RST" "$state" "$C_DIM" "vault: $(vault_sync_label) · ? help" "$C_RST"
 }
 
 # pad TEXT WIDTH: TEXT followed by spaces up to WIDTH characters. printf
@@ -168,7 +176,7 @@ menu_items_global() {
   printf 'sep\t%s%s%s\n' "$C_DIM" "──────────────────────────────── whole vault" "$C_RST"
   menu_line browse "≡" "Browse vault" "vault" "every saved project, clone + restore" dim
   menu_line sync "⇅" "Sync with GitHub" "vault ↔ GitHub" "bring in other machines' saves, push" dim
-  menu_line doctor "✚" "Doctor" "" "check the setup, with a fix for each problem" dim
+  menu_line doctor "✚" "Doctor" "" "check the setup, suggest fixes" dim
   menu_line config "⚙" "Settings" "" "paths and commands" dim
   menu_line rotate "⟳" "Rotate key" "vault" "new key, re-encrypt everything" dim
 }
@@ -212,7 +220,7 @@ cmd_menu() {
       }
     else
       items="$(menu_items_global | sed 1d)"
-      choice="$(printf '%s\n' "$items" | menu_fzf "envora" "${C_BOLD}envora${C_RST} ${C_DIM}v$VERSION · not in a project${C_RST}"$'\n'"${C_DIM}vault: $(vault_sync_label) · ? keys${C_RST}" "$pos")" || {
+      choice="$(printf '%s\n' "$items" | menu_fzf "envora" "${C_BOLD}envora${C_RST} ${C_DIM}v$VERSION · not in a project${C_RST}"$'\n'"${C_DIM}vault: $(vault_sync_label) · ? help${C_RST}" "$pos")" || {
         menu_fzf_failed && return 1
         return 0
       }

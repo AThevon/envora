@@ -125,7 +125,7 @@ Run `ev` inside a project:
 
 ```
  victordenay  3 files saved · 1 to save
- vault: ✓ synced with GitHub · ? keys
+ vault: ✓ synced with GitHub · ? help
  › ↑  Save                project → vault     encrypt this project's env files    │ ↑ Save  (ev save)   project → vault
    ↓  Restore             vault → project     write the saved env files back here │   ~ .env  changed here → replaces the vault copy
    ≈  Compare             project ↔ vault     see what differs (key names only)   │       adds STRIPE_KEY to the vault · updates DB_URL
