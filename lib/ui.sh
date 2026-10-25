@@ -1,93 +1,190 @@
 #!/usr/bin/env bash
-# lib/ui.sh - UI functions using gum
+# shellcheck disable=SC2034  # colors are used by the other modules
+# lib/ui.sh - output, colors and prompts
+#
+# Conventions:
+#   - say/ok/step: progress and results, on stderr, silenced by --quiet
+#   - warn/err:    always printed on stderr, one line each
+#   - out:         command output meant to be read or piped, on stdout
 
-# Emerald green gradient
-C_1=$'\033[38;2;16;185;129m'   # #10B981
-C_2=$'\033[38;2;52;211;153m'   # #34D399
-C_3=$'\033[38;2;110;231;183m'  # #6EE7B7
-C_4=$'\033[38;2;167;243;208m'  # #A7F3D0
-C_5=$'\033[38;2;209;250;229m'  # #D1FAE5
-C_DIM=$'\033[2m'
-C_BOLD=$'\033[1m'
-C_RESET=$'\033[0m'
-
-msg() {
-  echo "$@" >&2
+ui_init_colors() {
+  C_ACC="" C_DIM="" C_BOLD="" C_WARN="" C_ERR="" C_RST=""
+  local want=0
+  if [[ -n "${ENVORA_COLOR:-}" ]]; then
+    [[ "$ENVORA_COLOR" == "1" ]] && want=1
+  elif [[ -z "${NO_COLOR:-}" && -t 1 && -t 2 ]]; then
+    want=1
+  fi
+  if [[ $want == 1 ]]; then
+    C_ACC=$'\033[38;2;111;207;124m'
+    C_DIM=$'\033[38;2;128;136;148m'
+    C_BOLD=$'\033[1m'
+    C_WARN=$'\033[38;2;229;192;123m'
+    C_ERR=$'\033[38;2;224;108;117m'
+    C_RST=$'\033[0m'
+  fi
 }
 
-ui_success() {
-  gum log --level info "$@" >&2
+say() {
+  [[ "${QUIET:-0}" == 1 ]] && return 0
+  printf '%s\n' "$*" >&2
 }
 
-ui_warn() {
-  gum log --level warn "$@" >&2
+ok() {
+  [[ "${QUIET:-0}" == 1 ]] && return 0
+  printf '%s✓%s %s\n' "$C_ACC" "$C_RST" "$*" >&2
 }
 
-ui_error() {
-  gum log --level error "$@" >&2
+# Like ok, but for a result that is only partly done (e.g. not pushed).
+partial() {
+  [[ "${QUIET:-0}" == 1 ]] && return 0
+  printf '%s!%s %s\n' "$C_WARN" "$C_RST" "$*" >&2
 }
 
-ui_spin() {
-  local title="$1"
+# result RC message: ✓ when RC is 0, ! otherwise (exit 3: saved, not pushed).
+result() {
+  local rc="$1"
   shift
-  gum spin --spinner dot --title "$title" -- "$@"
+  if [[ "$rc" == 0 ]]; then ok "$@"; else partial "$@"; fi
 }
 
-ui_confirm() {
-  gum confirm \
-    --prompt.foreground="10" \
-    --selected.background="10" \
-    --selected.foreground="0" \
-    "$@"
+step() {
+  [[ "${QUIET:-0}" == 1 ]] && return 0
+  printf '%s·%s %s\n' "$C_DIM" "$C_RST" "$*" >&2
 }
 
-ui_header() {
+warn() {
+  if [[ "${QUIET:-0}" == 1 ]]; then
+    printf 'ev: warning: %s\n' "$*" >&2
+  else
+    printf '%s!%s %s\n' "$C_WARN" "$C_RST" "$*" >&2
+  fi
+}
+
+err() {
+  if [[ "${QUIET:-0}" == 1 ]]; then
+    printf 'ev: error: %s\n' "$*" >&2
+  else
+    printf '%s✗%s %s\n' "$C_ERR" "$C_RST" "$*" >&2
+  fi
+}
+
+die() {
+  err "$@"
+  exit 1
+}
+
+# A closed pipe (ev list | head -1) ends the command quietly.
+out() {
+  printf '%s\n' "$*" 2>/dev/null || exit 0
+}
+
+has() {
+  command -v "$1" >/dev/null 2>&1
+}
+
+# True when we may ask the user something.
+is_interactive() {
+  [[ "${ASSUME_YES:-0}" != 1 && -t 0 && -t 2 ]]
+}
+
+# confirm "question" [no] -> 0 for yes. With --yes: yes. Without a TTY: no.
+# A second argument "no" makes No the preselected answer.
+confirm() {
+  local q="$1" def="true"
+  [[ "${2:-}" == no ]] && def="false"
+  [[ "${ASSUME_YES:-0}" == 1 ]] && return 0
+  is_interactive || return 1
+  if has gum; then
+    gum confirm --default="$def" --prompt.foreground="#6fcf7c" \
+      --selected.background="#2b3a2e" --selected.foreground="#6fcf7c" "$q" </dev/tty
+  else
+    local a=""
+    printf '%s [y/N] ' "$q" >&2
+    IFS= read -r a </dev/tty || return 1
+    case "$a" in y|Y|yes|YES) return 0 ;; *) return 1 ;; esac
+  fi
+}
+
+# choose "header" item... -> prints the chosen item (one per line menus)
+choose() {
+  local header="$1"
+  shift
+  is_interactive || return 1
+  if has gum; then
+    gum choose --header="$header" --cursor.foreground="#6fcf7c" \
+      --header.foreground="#808894" "$@" </dev/tty
+  else
+    local i=1 item a=""
+    printf '%s\n' "$header" >&2
+    for item in "$@"; do
+      printf '  %d) %s\n' "$i" "$item" >&2
+      i=$((i + 1))
+    done
+    printf '> ' >&2
+    IFS= read -r a </dev/tty || return 1
+    case "$a" in ''|*[!0-9]*) return 1 ;; esac
+    [[ $a -ge 1 && $a -le $# ]] || return 1
+    local items=("$@")
+    printf '%s\n' "${items[$((a - 1))]}"
+  fi
+}
+
+# ask "prompt" [default] -> prints the answer
+ask() {
+  local prompt="$1" def="${2:-}"
+  is_interactive || return 1
+  if has gum; then
+    gum input --prompt="$prompt " --value="$def" --prompt.foreground="#6fcf7c" </dev/tty
+  else
+    local a=""
+    printf '%s [%s] ' "$prompt" "$def" >&2
+    IFS= read -r a </dev/tty || return 1
+    printf '%s\n' "${a:-$def}"
+  fi
+}
+
+# join_by sep items...
+join_by() {
+  local sep="$1" first=1 item res=""
+  shift
+  for item in "$@"; do
+    if [[ $first == 1 ]]; then res="$item"; first=0; else res="$res$sep$item"; fi
+  done
+  printf '%s' "$res"
+}
+
+# Compact list for messages: "a, b, c +2 more"
+short_list() {
+  local max="$1"
+  shift
+  local n=$# shown=() i=0 item
+  for item in "$@"; do
+    [[ $i -ge $max ]] && break
+    shown[${#shown[@]}]="$item"
+    i=$((i + 1))
+  done
+  local res
+  res="$(join_by ', ' ${shown[@]+"${shown[@]}"})"
+  if [[ $n -gt $max ]]; then
+    res="$res +$((n - max)) more"
+  fi
+  printf '%s' "$res"
+}
+
+plural() {
+  # plural N word -> "1 file" / "2 files"
+  if [[ "$1" == 1 ]]; then printf '%s %s' "$1" "$2"; else printf '%s %ss' "$1" "$2"; fi
+}
+
+ui_logo() {
+  [[ "${QUIET:-0}" == 1 ]] && return 0
   cat >&2 <<EOF
-${C_1} ▄▄▄▄▄▄▄${C_2} ▄▄▄    ▄▄▄${C_3} ▄▄▄▄  ▄▄▄▄${C_4}   ▄▄▄▄▄${C_5}   ▄▄▄▄▄▄▄     ▄▄▄▄${C_RESET}
-${C_1}███▀▀▀▀▀${C_2} ████▄  ███${C_3} ▀███  ███▀${C_4} ▄███████▄${C_5} ███▀▀███▄ ▄██▀▀██▄${C_RESET}
-${C_1}███▄▄   ${C_2} ███▀██▄███${C_3}  ███  ███${C_4}  ███   ███${C_5} ███▄▄███▀ ███  ███${C_RESET}
-${C_1}███     ${C_2} ███  ▀████${C_3}  ███▄▄███${C_4}  ███▄▄▄███${C_5} ███▀▀██▄  ███▀▀███${C_RESET}
-${C_1}▀███████${C_2} ███    ███${C_3}   ▀████▀${C_4}    ▀█████▀${C_5}  ███  ▀███ ███  ███${C_RESET}
-${C_DIM}                encrypted .env vault${C_RESET}
-EOF
-}
-
-show_help() {
-  ui_header
-  cat >&2 <<EOF
-
-${C_BOLD}USAGE${C_RESET}
-  ev                   Interactive mode (context-aware)
-  ev <command>         Run a specific command
-
-${C_BOLD}COMMANDS${C_RESET}
-  ${C_2}push${C_RESET}          [project]  Push all .env files (local + Vercel if detected)
-  ${C_2}push-local${C_RESET}    [project]  Push only local .env files
-  ${C_2}push-vercel${C_RESET}   [project]  Push only Vercel env vars
-  ${C_2}pull${C_RESET}          [project]  Decrypt and restore .env files from the vault
-  ${C_2}diff${C_RESET}          [project]  Compare local .env files with the vault
-  ${C_2}list${C_RESET}                     List all projects in the vault
-  ${C_2}clean${C_RESET}                    Remove a project from the vault
-  ${C_2}rotate${C_RESET}                   Generate new age key and re-encrypt vault
-  ${C_2}config${C_RESET}                   View and edit settings
-  ${C_2}init${C_RESET}                     Set up the vault (first-time setup)
-  ${C_2}help${C_RESET}                     Show this help
-
-${C_BOLD}WORKFLOW${C_RESET}
-  ${C_DIM}1.${C_RESET} Run ${C_2}ev init${C_RESET} to create your encrypted vault
-  ${C_DIM}2.${C_RESET} Save the age key displayed during init in your password manager
-  ${C_DIM}3.${C_RESET} Use ${C_2}ev push${C_RESET} to encrypt and back up .env files
-  ${C_DIM}4.${C_RESET} Use ${C_2}ev pull${C_RESET} to restore them on any machine
-  ${C_DIM}5.${C_RESET} Use ${C_2}ev vercel${C_RESET} to import env vars from Vercel
-
-${C_BOLD}INTERACTIVE MODE${C_RESET}
-  Inside a git repo: shows project-specific actions first
-  Outside a repo:    shows global actions (list, config, rotate)
-
-${C_BOLD}CONFIG${C_RESET}  ~/.envorarc
-  ENVORA_VAULT    Path to vault directory     (default: ~/.env-vault)
-  ENVORA_KEY      Path to age private key     (default: ~/.age/key.txt)
-  ENVORA_PROJECTS Path to projects directory  (default: ~/projects)
-  ENVORA_REPO     GitHub repo for the vault   (set during init)
+${C_ACC} ▄▄▄▄▄▄▄ ▄▄▄    ▄▄▄ ▄▄▄▄  ▄▄▄▄   ▄▄▄▄▄   ▄▄▄▄▄▄▄     ▄▄▄▄
+███▀▀▀▀▀ ████▄  ███ ▀███  ███▀ ▄███████▄ ███▀▀███▄ ▄██▀▀██▄
+███▄▄    ███▀██▄███  ███  ███  ███   ███ ███▄▄███▀ ███  ███
+███      ███  ▀████  ███▄▄███  ███▄▄▄███ ███▀▀██▄  ███▀▀███
+▀███████ ███    ███   ▀████▀    ▀█████▀  ███  ▀███ ███  ███${C_RST}
+${C_DIM}                encrypted .env vault${C_RST}
 EOF
 }
